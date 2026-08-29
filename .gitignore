@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build output — build_rl_router.sh writes here (BUILD_DIR)
+/build_rl/
+
+# Local interpreter, if used instead of conda
+/.venv/
+
+# Crash logs written by the engine server (KICAD_CRASH_DIR)
+/var/

@@ -6,7 +6,8 @@
 3. processed_unrouted.kicad_pcb -> processed_unrouted.dsn (Specctra DSN)
 
 Set DRVZERO_DATA_DIR to the directory that holds ``pcbbench_drvzero_filtered/``
-and ``PCBench/PCBs/`` (output goes to ``<dir>/drvzero_filtered/``).
+and ``PCBench/PCBs/`` (output goes to ``<dir>/drvzero_filtered/``). Env-var
+only — the dataset root is machine-specific and never hardcoded here.
 """
 
 import os

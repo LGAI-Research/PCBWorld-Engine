@@ -32,13 +32,12 @@ outliers (shove). A wedged server is killed by the client via process kill.
 
 This repository is self-contained: nothing here imports the environment
 package. ``wire.py`` — the protocol both programs speak — ships on both
-sides as a byte-identical copy, and ``thread_cap.py`` is the bundle-local
-thread-pool cap.
+sides as a byte-identical copy; ``thread_cap.py`` (thread-pool cap) and
+``crash_diag.py`` (fatal-signal crash logs) are bundle-local.
 """
 
 from __future__ import annotations
 
-import faulthandler
 import os
 import pickle
 import signal
@@ -65,6 +64,7 @@ else:
 if os.path.isdir(_RL_LIB_PATH) and _RL_LIB_PATH not in sys.path:
     sys.path.insert(0, _RL_LIB_PATH)
 
+from crash_diag import install_crash_handler, remove_log_if_empty  # noqa: E402  (bundle-local)
 from wire import (  # noqa: E402  (bundle-local — see _BUNDLE_DIR above)
     KRL_CONSTANT_NAMES,
     KRL_FIELDS,
@@ -75,9 +75,6 @@ from wire import (  # noqa: E402  (bundle-local — see _BUNDLE_DIR above)
 _LEN = struct.Struct(">Q")
 PROTOCOL_VERSION = 2
 
-# Kept alive for the process lifetime: faulthandler writes to this fd from a
-# signal handler, so it must not be garbage-collected.
-_CRASH_LOG = None
 
 
 def _send(sock: socket.socket, obj) -> None:
@@ -258,49 +255,8 @@ def _cleanup_ipc_dir(sock_path: str) -> None:
         pass
 
 
-def _install_crash_handler() -> None:
-    """Dump this process's stack to the crash-log dir on a fatal signal.
-
-    The router is C++, so a segfault or abort here kills the process with no
-    Python traceback. faulthandler writes the interpreter-level stack (and
-    the C frames the signal handler can reach) to a per-pid file, which the
-    client points at in its crash message. Same env-var contract as the
-    environment's diagnostics: ``KICAD_CRASH_LOG_DIR`` chooses the directory
-    (the client sets it to its own tree), ``KICAD_CRASH_DIAG=0`` turns it
-    off. Best effort — a failure here must never block startup.
-    """
-    if os.environ.get("KICAD_CRASH_DIAG", "1") == "0":
-        return
-    try:
-        log_dir = os.environ.get(
-            "KICAD_CRASH_LOG_DIR", os.path.join(_REPO_ROOT, "var", "crashlogs"))
-        os.makedirs(log_dir, exist_ok=True)
-        global _CRASH_LOG
-        _CRASH_LOG = open(
-            os.path.join(log_dir, f"engine_server_{os.getpid()}.log"), "w")
-        faulthandler.enable(file=_CRASH_LOG, all_threads=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"engine server: crash handler unavailable ({exc})",
-              file=sys.stderr, flush=True)
-
-
-def _drop_empty_crash_log() -> None:
-    """A clean exit leaves no artifact — only real crashes write to the log."""
-    if _CRASH_LOG is None:
-        return
-    try:
-        name = _CRASH_LOG.name
-        _CRASH_LOG.flush()
-        if os.path.getsize(name) == 0:
-            faulthandler.disable()
-            _CRASH_LOG.close()
-            os.unlink(name)
-    except OSError:
-        pass
-
-
 def main(sock_path: str) -> None:
-    _install_crash_handler()
+    install_crash_handler(role="engine_server")
 
     import kicad_rl_router as krl
 
@@ -317,7 +273,7 @@ def main(sock_path: str) -> None:
 
     def _on_sigterm(*_a):
         _cleanup_ipc_dir(sock_path)
-        _drop_empty_crash_log()
+        remove_log_if_empty()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
@@ -350,7 +306,7 @@ def main(sock_path: str) -> None:
     host.close_router()
     conn.close()
     _cleanup_ipc_dir(sock_path)
-    _drop_empty_crash_log()
+    remove_log_if_empty()
 
 
 if __name__ == "__main__":

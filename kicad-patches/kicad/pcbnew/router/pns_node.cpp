@@ -20,7 +20,9 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+// PCBWorld-mod begin 2026-09-01
 #include <algorithm>
+// PCBWorld-mod end
 #include <vector>
 #include <cassert>
 #include <utility>
@@ -32,7 +34,9 @@
 #include <zone.h>
 
 #include <wx/log.h>
+// PCBWorld-mod begin 2026-09-01
 #include <wx/debug.h>   // wxASSERT_MSG — comparator invariant self-check
+// PCBWorld-mod end
 
 #include "pns_arc.h"
 #include "pns_item.h"
@@ -54,6 +58,7 @@ namespace PNS {
 static std::unordered_set<const NODE*> allocNodes;
 #endif
 
+// PCBWorld-mod begin 2026-09-01
 int canonicalItemCompare( const ITEM* aA, const ITEM* aB )
 {
     // THE single ordering of PNS items — see the contract at its declaration
@@ -168,6 +173,7 @@ bool NODE::ItemOrder( const ITEM* aA, const ITEM* aB )
 }
 
 
+// PCBWorld-mod end
 NODE::NODE()
 {
     m_depth = 0;
@@ -286,6 +292,7 @@ NODE* NODE::Branch()
     {
         JOINT_MAP::iterator j;
 
+        // PCBWorld-mod begin 2026-09-01
         // *m_index iterates an unordered_set<ITEM*> in HEAP-ADDRESS order.
         // Inserting in that order builds the child's INDEX net-lists and
         // R-tree with an address-dependent structure, and first-hit collision
@@ -300,6 +307,7 @@ NODE* NODE::Branch()
         std::sort( items.begin(), items.end(), nodeItemOrder );
 
         for( ITEM* item : items )
+        // PCBWorld-mod end
             child->m_index->Add( item );
 
         child->m_joints = m_joints;
@@ -486,6 +494,11 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
             obstacleHull.Append( bbox.GetRight(), bbox.GetTop()    );
             obstacleHull.Append( bbox.GetRight(), bbox.GetBottom() );
             obstacleHull.Append( bbox.GetLeft(),  bbox.GetBottom() );
+            // PCBWorld-mod begin 2026-09-01
+            // Upstream leaves this chain open after Clear(); PointInside() then rejects every
+            // point and the 90-degree walkaround can never get around the obstacle.
+            obstacleHull.SetClosed( true );
+            // PCBWorld-mod end
         }
         //debugDecorator->AddLine( obstacleHull, 2, 40000, "obstacle-hull-test" );
         //debugDecorator->AddLine( aLine->CLine(), 5, 40000, "obstacle-test-line" );
@@ -516,6 +529,11 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
                 obstacleHull.Append( bbox.GetRight(), bbox.GetTop()    );
                 obstacleHull.Append( bbox.GetRight(), bbox.GetBottom() );
                 obstacleHull.Append( bbox.GetLeft(),  bbox.GetBottom() );
+                // PCBWorld-mod begin 2026-09-01
+                // Upstream leaves this chain open after Clear(); PointInside() then rejects every
+                // point and the 90-degree walkaround can never get around the obstacle.
+                obstacleHull.SetClosed( true );
+                // PCBWorld-mod end
             }
             //debugDecorator->AddLine( obstacleHull, 3 );
 
@@ -979,6 +997,7 @@ void NODE::rebuildJoint( const JOINT* aJoint, const ITEM* aItem )
     // and re-link them, using the former via's link list
     for( ITEM* link : links )
     {
+        // PCBWorld-mod begin 2026-09-01
         // Backstop against a stale/dangling link: a link that is no longer in
         // the index has been removed (and possibly already freed), so it must
         // never be dereferenced (link->Layers() below). INDEX::Contains is an
@@ -989,6 +1008,7 @@ void NODE::rebuildJoint( const JOINT* aJoint, const ITEM* aItem )
                 && ( isRoot() || !m_root->m_index->Contains( link ) ) )
             continue;
 
+        // PCBWorld-mod end
         if( link != aItem )
             linkJoint( tag.pos, link->Layers(), net, link );
         else if( !completelyErased )
@@ -997,6 +1017,7 @@ void NODE::rebuildJoint( const JOINT* aJoint, const ITEM* aItem )
 }
 
 
+// PCBWorld-mod begin 2026-09-01
 const JOINT* NODE::findJointByItem( const ITEM* aItem ) const
 {
     // Address-only fallback for a tag-keyed FindJoint() miss: scan the joint map
@@ -1026,6 +1047,7 @@ void NODE::removeViaIndex( VIA* aVia )
         jt = findJointByItem( aVia );
     if( jt )
         rebuildJoint( jt, aVia );
+// PCBWorld-mod end
 }
 
 
@@ -1035,6 +1057,7 @@ void NODE::removeSolidIndex( SOLID* aSolid )
         return;
 
     // fixme: redundant code
+    // PCBWorld-mod begin 2026-09-01
     // See removeViaIndex(): the same tag-keyed FindJoint() miss can leave aSolid
     // dangling-linked, so fall back to the address scan.
     const JOINT* jt = FindJoint( aSolid->Pos(), aSolid->Layers().Start(), aSolid->Net() );
@@ -1134,6 +1157,7 @@ void NODE::CanonicalizeOrder()
     for( ITEM* item : items )
         m_index->Add( item );
 
+    // PCBWorld-mod end
 }
 
 
@@ -1449,6 +1473,7 @@ int NODE::FindLinesBetweenJoints( const JOINT& aA, const JOINT& aB, std::vector<
 
 void NODE::FixupVirtualVias()
 {
+    // PCBWorld-mod begin 2026-09-01
     // Idempotent: drop any virtual vias synthesized by a previous call before
     // re-deriving, so this is safe to re-run on a live world (e.g. after an
     // incremental RL restore) without accumulating duplicate VVIAs. On a fresh
@@ -1462,6 +1487,7 @@ void NODE::FixupVirtualVias()
     for( ITEM* item : staleVvias )
         Remove( item );
 
+    // PCBWorld-mod end
     const SEGMENT* locked_seg = nullptr;
     std::vector<VVIA*> vvias;
 
@@ -1766,12 +1792,14 @@ void NODE::GetUpdatedItems( ITEM_VECTOR& aRemoved, ITEM_VECTOR& aAdded )
 
     for( ITEM* item : *m_index )
         aAdded.push_back( item );
+// PCBWorld-mod begin 2026-09-01
 
     // Emit in a stable, address-independent order (see nodeItemOrder): the caller
     // assigns each added item its board KIID in this order, so it must not depend
     // on the heap-address iteration of the unordered sets above.
     std::sort( aRemoved.begin(), aRemoved.end(), nodeItemOrder );
     std::sort( aAdded.begin(), aAdded.end(), nodeItemOrder );
+// PCBWorld-mod end
 }
 
 
@@ -1804,12 +1832,14 @@ void NODE::releaseGarbage()
         }
     }
 
+    // PCBWorld-mod begin 2026-09-01
     // Deletion order here does not influence routing determinism: every
     // comparator tie-break (canonicalItemCompare) is keyed on ITEM::Serial()
     // rather than heap
     // address, so a stable delete order isn't needed. Sorting by
     // Parent()->m_Uuid here would also be unsafe: a garbage item's board
     // parent may already be freed (deleteTrack* → resyncWorld path).
+    // PCBWorld-mod end
     if( m_ruleResolver )
     {
         m_ruleResolver->ClearCacheForItems( toDelete );
@@ -1829,6 +1859,7 @@ void NODE::Commit( NODE* aNode )
     if( aNode->isRoot() )
         return;
 
+    // PCBWorld-mod begin 2026-09-01
     // Fold the branch's removals then additions into the root in a stable,
     // address-independent order (see nodeItemOrder) so the resulting index and
     // board-UUID assignment are reproducible run-to-run instead of following the
@@ -1843,6 +1874,7 @@ void NODE::Commit( NODE* aNode )
         Remove( item );
 
     for( ITEM* item : added )
+    // PCBWorld-mod end
     {
         if( item->HasHole() )
         {

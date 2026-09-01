@@ -34,7 +34,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, '/usr/lib/python3/dist-packages')
+sys.path.append('/usr/lib/python3/dist-packages')  # fallback: apt KiCad's pcbnew; PYTHONPATH (e.g. build_rl/pcbnew) outranks it
 import pcbnew
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

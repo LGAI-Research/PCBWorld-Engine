@@ -2052,7 +2052,7 @@ std::vector<RLFootprintInfo> PNS_RL_ROUTER::getFootprints() const
 // Canonicalised over (position, cluster), NOT the anchor instance: several
 // coincident anchors can exist at one point (via centre + track end + pad)
 // and WHICH one the MST picked is a tie-break that varies across ratsnest
-// rebuilds — reporting the picked anchor's parent alone would make obs layers
+// rebuilds — reporting the picked anchor's parent made obs layers
 // nondeterministic. Union the copper of every same-cluster item anchored at
 // this position instead; that depends only on board state.
 static int anchorCopperLayer( const std::shared_ptr<const CN_ANCHOR>& aAnchor )
@@ -2246,7 +2246,11 @@ std::vector<RLClusterPoint> PNS_RL_ROUTER::getConnectedPoints( double x_mm, doub
     if( !hit )
         return result;
 
-    BOARD_CONNECTED_ITEM* seed = dynamic_cast<BOARD_CONNECTED_ITEM*>( hit->Parent() );
+    // BoardItem(), not Parent(): PNS indexes a thru-hole pad's / via's HOLE as a
+    // separate parentless ITEM, and canonicalItemCompare sorts parentless items
+    // (nil UUID) first, so inside the drill radius itemAt() returns the HOLE.
+    // HOLE::Parent() is null; HOLE::BoardItem() resolves to the owning pad/via.
+    BOARD_CONNECTED_ITEM* seed = dynamic_cast<BOARD_CONNECTED_ITEM*>( hit->BoardItem() );
 
     if( !seed )
         return result;
@@ -2578,8 +2582,8 @@ RLBoundingBox PNS_RL_ROUTER::getBoardBBox() const
     // Edge.Cuts-only bbox = the physical board size (selected by LAYER, so
     // lines/arcs/circles/polys and footprint-embedded edges all count; tracks,
     // zones and off-board silk/text never do). The all-items GetBoundingBox()
-    // would let decorations and agent copper inflate the obs/wirelength scale —
-    // on real boards by up to 1.6x.
+    // let decorations and agent copper inflate the obs/wirelength scale —
+    // real boards measured up to 1.6x oversized.
     const BOX2I bbox = m_board->GetBoardEdgesBoundingBox();
 
     if( bbox.GetWidth() <= 0 || bbox.GetHeight() <= 0 )
@@ -2896,7 +2900,7 @@ void PNS_RL_ROUTER::save( const std::string& output_path,
         // held by another process — or left stale by a crash — and
         // SaveProjectAs copies it onto the output PROJECT_FILE, whose
         // SaveToFile then silently no-ops: the routed .kicad_pcb would land
-        // without its rules sidecar (a parallel-eval hazard). This
+        // without its rules sidecar (parallel-eval hazard). This
         // engine never writes back to the SOURCE project — this save-as to a
         // new path is its only project write — so clearing the flag here,
         // scoped to the save rather than at load, loses no protection: the

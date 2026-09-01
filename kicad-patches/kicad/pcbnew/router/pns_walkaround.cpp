@@ -23,8 +23,10 @@
 #include <advanced_config.h>
 #include <optional>
 
+// PCBWorld-mod begin 2026-09-01
 #include <wx/log.h>
 
+// PCBWorld-mod end
 #include <geometry/shape_line_chain.h>
 
 #include "pns_walkaround.h"
@@ -144,6 +146,7 @@ bool WALKAROUND::singleStep()
     {
         PNS_DBG( Dbg(), BeginGroup, wxString::Format( "cluster-details [cw %d]", aCw?1:0 ), 1 );
 
+        // PCBWorld-mod begin 2026-09-01
         // Determinism: this loop is NOT aborted on a wallclock timeout
         // (m_PNSProcessClusterTimeout, a GUI mouse-responsiveness knob), which
         // would process a different NUMBER of cluster items each run and diverge
@@ -172,6 +175,7 @@ bool WALKAROUND::singleStep()
                                   elapsed, clusterTimeoutMs, (int) aCluster.m_items.size() );
                     clusterTimeoutWarned = true;
                 }
+        // PCBWorld-mod end
             }
 
             int clearance = m_world->GetClearance( clItem, &aLine, false );
@@ -185,6 +189,11 @@ bool WALKAROUND::singleStep()
                 hull.Append( bbox.GetRight(), bbox.GetTop()    );
                 hull.Append( bbox.GetRight(), bbox.GetBottom() );
                 hull.Append( bbox.GetLeft(),  bbox.GetBottom() );
+                // PCBWorld-mod begin 2026-09-01
+                // Upstream leaves this chain open after Clear(); PointInside() then rejects every
+                // point and the 90-degree walkaround can never get around the obstacle.
+                hull.SetClosed( true );
+                // PCBWorld-mod end
             }
 
             LINE tmp( aLine );

@@ -34,10 +34,11 @@ The kicad_pcb → DSN conversion uses `pcbnew.ExportSpecctraDSN()` (the same
 function KiCad's UI emits for export-to-Specctra). The ORP build path reads
 pad / net / layer / DRC information through the same `pcbnew` bindings.
 
-No replacement is available in pure Python; KiCad 9 ships pcbnew either via
-the system package (`/usr/lib/python3/dist-packages/pcbnew`) on a host with
-KiCad installed, or via the `kicad-cli pcb export specctra` subcommand
-(which the scripts do not currently use).
+No replacement is available in pure Python. The engine's own build provides it:
+`BUILD_CLI=1 BUILD_PCBNEW=1 bash build_rl_router.sh` puts `pcbnew.py` + `_pcbnew.so`
+in `build_rl/pcbnew` (see the root README, "Build"), importable by the interpreter
+the build was configured with. A host KiCad install
+(`/usr/lib/python3/dist-packages/pcbnew`) works as well.
 
 ## Typical invocation
 
@@ -59,9 +60,21 @@ export SYNTH1L_DSN_ROOT=$CADAGENT_DATA_ROOT/synthetic/synth_1L_grid50_5net_v02_d
 /usr/bin/python3 pcbnew_prep/make_dsn_orp_synth_1l_g50.py
 ```
 
-> System Python (`/usr/bin/python3`) is used intentionally — it's the
-> interpreter that picks up the pcbnew library. The cadagent conda env's
-> Python 3.12 does **not** have pcbnew.
+> `pcbnew_env/` holds the container recipe the shipped mirrors were originally built
+> with. No script or setup step invokes it — it is a manual historical record.
+>
+> Any interpreter that imports `pcbnew` works. The engine's source build serves the
+> conda env's python via `PYTHONPATH=build_rl/pcbnew python …`; `/usr/bin/python3`
+> is the interpreter an apt-installed KiCad extends.
+>
+> Verified 2026-09-01 with the source-built pcbnew 9.0.8 on
+> `synth_1L_grid10_5net_v02/test` (5 boards) against the shipped DSN/ORP mirror:
+> `.orp` byte-identical (export timestamp aside); `.dsn` byte-identical (output
+> path + `host_version` lines aside) once the script's `SetCopperLayerCount(1)`
+> line is accounted for — that line postdates the mirror (added 2026-05-31, the
+> mirror was generated before it), so the shipped mirror is the 2-copper-layer
+> variant while today's script emits the 1-layer variant, locally and in Docker
+> alike.
 
 ## Expected pre-converted layout under `$CADAGENT_DATA_ROOT`
 

@@ -1,24 +1,25 @@
 #!/usr/bin/python3
-"""Batch driver for kicad_to_orp inside the pcbnew container.
+"""Batch driver for kicad_to_orp: one process converts a whole dataset.
 
 Reads a JSON manifest ``[{"pcb": "<in.kicad_pcb>", "orp": "<out.orp>",
 "pro": "<optional .kicad_pro>"}...]`` and converts each board in a single
-process, so one ``docker run`` covers a whole dataset instead of paying the
-container-startup cost per board.
+process, so the pcbnew import is paid once instead of per board.
 
-Runs *inside* ``pcbnew-repro:9.0`` (or any env where ``import pcbnew`` works).
-``kicad_to_orp`` lives next to this file in ``baselines/OrthoRoute/`` — we add
-that directory to ``sys.path`` so no PYTHONPATH is needed.
+Runs in any interpreter where ``import pcbnew`` works — the engine's own build
+(``PYTHONPATH=build_rl/pcbnew``) or a host KiCad's python. ``kicad_to_orp`` is
+looked up next to this file's parent in ``OrthoRoute/``.
 
-Usage (inside container):
-  python3 batch_kicad_to_orp.py /out/_manifest.json
+Usage:
+  PYTHONPATH=build_rl/pcbnew python batch_kicad_to_orp.py <manifest.json>
 """
 import json
 import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-# kicad_to_orp.py is under baselines/OrthoRoute/
+# kicad_to_orp.py is NOT shipped in this tree (a leftover of the original prep tree):
+# this driver fails at import until it is restored. The rule-based pipeline normally
+# skips it entirely by reading the pre-converted mirrors (--orp-root / *_dsn datasets).
 sys.path.insert(0, str(_HERE.parent / "OrthoRoute"))
 import kicad_to_orp  # noqa: E402
 

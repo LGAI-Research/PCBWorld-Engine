@@ -20,10 +20,13 @@ tree is distributed from there.
 | [`kicad-python/`](kicad-python) | git submodule, pinned to upstream KiCad 9.0.8. Not redistributed by this repository — `git submodule update --init --recursive` fetches it from upstream |
 | [`kicad-patches/kicad/`](kicad-patches/kicad) | our modified copies of the upstream KiCad files the build replaces, one full file per upstream path |
 | [`kicad-patches/rl/`](kicad-patches/rl) | our C++ sources: the headless RL router, its DRC fork, and the pybind11 module `kicad_rl_router`. GPLv3 because they link KiCad |
+| [`CHANGELOG.md`](CHANGELOG.md) | the release notes, newest first — one `## vX.Y.Z` section per published release |
 | [`kicad-patches/ENGINE_VERSION`](kicad-patches/ENGINE_VERSION) | the engine version, stamped next to the built module as a build-provenance marker |
 | [`engine_server/`](engine_server) | the server process. The only process in the project that imports `kicad_rl_router` |
-| [`pcbnew_prep/`](pcbnew_prep) | dataset pre-conversion scripts (`kicad_pcb` → DSN/ORP). They import KiCad's `pcbnew` Python module, so they live on this side of the boundary |
-| [`build_rl_router.sh`](build_rl_router.sh) | rsync the submodule into `build_rl/kicad_src`, drop in `kicad-patches/`, run cmake + ninja |
+| [`pcbnew_prep/`](pcbnew_prep) | dataset pre-conversion scripts (`kicad_pcb` → DSN/ORP). They import KiCad's `pcbnew` Python module, so they live on this side of the boundary — the module built here with `BUILD_PCBNEW=1` (or any host KiCad's python) |
+| [`build_rl_router.sh`](build_rl_router.sh) | rsync the submodule into `build_rl/kicad_src`, drop in `kicad-patches/`, run cmake + ninja (`BUILD_CLI=1 BUILD_PCBNEW=1` add `kicad-cli` and the `pcbnew` module, see Build) |
+| [`docs/upstream-diff/`](docs/upstream-diff) | **generated, read-only**: one unified diff per modified upstream file — exactly what this engine changes in KiCad. Not a build input; regenerate with `tools/make_upstream_diff.sh` |
+| [`tools/`](tools) | `make_upstream_diff.sh` (regenerates the view above and proves it round-trips) · `diff_patches.sh` (ad-hoc diff summary against the pinned upstream) |
 
 ## Build
 
@@ -38,6 +41,39 @@ Output: `build_rl/pcbnew/python/rl/kicad_rl_router.so`, stamped with a copy of
 
 `BUILD_DIR` overrides where the build lands; the environment sets it to its own tree so
 the module is built once, next to the code that spawns this server.
+
+### Optional targets: `kicad-cli` and the `pcbnew` Python module
+
+The default build is the RL module alone — all the environment needs, and fast. Two
+switches add the headless KiCad tools that the environment's data-preparation chain runs
+as child processes, built from the same pinned, patched source:
+
+```bash
+BUILD_CLI=1 BUILD_PCBNEW=1 bash build_rl_router.sh
+KICAD_RUN_FROM_BUILD_DIR=1 build_rl/kicad/kicad-cli --version                          # 9.0.8
+PYTHONPATH=build_rl/pcbnew python -c 'import pcbnew; print(pcbnew.GetBuildVersion())'   # 9.0.8
+```
+
+| switch | ninja targets | output |
+|---|---|---|
+| `BUILD_CLI=1` | `kicad-cli` | `build_rl/kicad/kicad-cli` |
+| `BUILD_PCBNEW=1` | `pcbnew_kiface pcbnew_python_module` | `build_rl/pcbnew/_pcbnew.kiface` and, beside it, `pcbnew.py` + `_pcbnew.so` (a symlink to the kiface): `build_rl/pcbnew` on `PYTHONPATH` is the whole install, for the interpreter the build was configured with (`PYTHON_EXECUTABLE`) |
+
+- `kicad-cli pcb …` loads `_pcbnew.kiface`, so `BUILD_CLI=1` is useful only together with
+  `BUILD_PCBNEW=1`. Run from the build tree, `kicad-cli` finds the kiface (one directory up,
+  in `pcbnew/`) only with `KICAD_RUN_FROM_BUILD_DIR=1` in its environment; without it every
+  `pcb` command fails with "Failed to load kiface library".
+- `BUILD_PCBNEW=1` needs SWIG (`swig` on `PATH`) and OpenCASCADE: the kiface carries the
+  STEP exporter. The script hands the Homebrew or the active conda env's OCC to CMake
+  whenever one is present — for engine-only builds too, so the configuration does not flip
+  between the two invocations of one build tree. The RL module itself never touches OCC.
+- Cost (64-core host): the three targets together are 1 352 ninja steps from scratch, about
+  4.5 minutes. A tree configured before OCC was available recompiles everything once when
+  OCC first lands (the compile flags change). Re-running the script with unchanged sources
+  is a link-only no-op — KiCad regenerates its version header on every build, so 7–13 steps
+  and about 15 seconds, with either switch setting.
+- The DRC these tools run is this engine's: the `drc_engine.cpp` patch lifts the per-type
+  report caps (199 / 499 in stock KiCad), so `kicad-cli pcb drc` reports every violation.
 
 ## Test
 

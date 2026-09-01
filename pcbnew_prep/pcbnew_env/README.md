@@ -1,4 +1,17 @@
-# pcbnew environment for reproducing the synth DSN/ORP
+# pcbnew environment for reproducing the synth DSN/ORP (historical recipe)
+
+> **Nothing in this project runs this image.** The `pcbnew` every script uses is the
+> engine's own build of the pinned 9.0.8 source — `BUILD_CLI=1 BUILD_PCBNEW=1 bash
+> build_rl_router.sh`, then `PYTHONPATH=build_rl/pcbnew python …` (root README, "Build") —
+> the same KiCad the router runs, with no apt/PPA/container in any code path or setup
+> step. This directory is kept only as the manual record of how the shipped DSN/ORP
+> mirrors were originally produced, and to reconstruct the historic apt build's
+> `host_version` string by hand if anyone ever needs to.
+>
+> The source-built module's output is verified against those mirrors (2026-09-01, see
+> `../README.md`): `.orp` byte-identical (timestamp aside); `.dsn` byte-identical
+> (path + `host_version` aside) up to the script's own later `SetCopperLayerCount(1)`
+> change, which no build reproduces the mirror through.
 
 The synthetic-board Freerouting input (`*_unrouted.dsn`) and OrthoRoute
 (`*.orp`) files are produced by **KiCad's `pcbnew` Python module** through
@@ -23,7 +36,9 @@ Every reference DSN header records:
 Target build: **KiCad `9.0.8-9.0.8~ubuntu22.04.1`** (Ubuntu 22.04 / jammy build
 from the official KiCad stable PPA). `pcbnew` ships *inside* the apt `kicad`
 package at `/usr/lib/python3/dist-packages/pcbnew.py`; there is no pip/conda-only
-package that yields this build, so the Docker route below is the supported one.
+package that yields this build. The engine's source build (`BUILD_PCBNEW=1`) is the
+same 9.0.8 code; only the `host_version` string differs (`9.0.8` vs
+`9.0.8-9.0.8~ubuntu22.04.1`).
 
 ## The original generator environment
 

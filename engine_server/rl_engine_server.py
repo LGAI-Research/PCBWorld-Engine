@@ -1,0 +1,374 @@
+"""Engine server: hosts kicad_rl_router.RLRouter behind a unix socket.
+
+This is the only process in the project that loads the KiCad shared library
+(``kicad_rl_router.so``). The environment's client — ``router_client.py`` in
+its own repository — spawns one server per engine and talks a
+primitives-only pickle protocol, so no KiCad type ever crosses the process
+boundary.
+
+Protocol (length-prefixed pickle, one request/response pair at a time):
+  server → client on connect: handshake
+      {"protocol": 2, "schema": KRL_FIELDS, "constants": {name: int},
+       "pid": int}
+    The schema is validated against the LIVE binding at startup and the
+    client validates it against its own copy of ``wire.py`` — a drifted
+    binding fails loudly on both sides (the "constant handshake").
+  client → server requests, server → client {"ok": True, "value": wire}
+  or {"ok": False, "etype", "msg", "tb"} (client re-raises):
+      ("construct",  kwargs)              build the RLRouter (refuses if
+                                          one is live — KiCad global state
+                                          allows one router per process)
+      ("call",       (name, args, kwargs))  getattr(router, name)(*args, **kwargs)
+      ("batch",      [(name, args, kwargs), ...])  sequential calls, one roundtrip
+      ("module_call",(name, args))        getattr(kicad_rl_router, name)(*args)
+      ("close_router", None)              cancel sessions + drop the router
+      ("ping",       None)                liveness probe
+  Protocol 2 (port v0.31) added the kwargs slot to call/batch — the binding
+  surface now has keyword-arg call sites (``cleanup_tracks``).
+  EOF / socket close → server exits (ties lifetime to the client).
+
+No per-call timeouts by design: routing calls have legitimate multi-minute
+outliers (shove). A wedged server is killed by the client via process kill.
+
+This repository is self-contained: nothing here imports the environment
+package. ``wire.py`` — the protocol both programs speak — ships on both
+sides as a byte-identical copy; ``thread_cap.py`` (thread-pool cap) and
+``crash_diag.py`` (fatal-signal crash logs) are bundle-local.
+"""
+
+from __future__ import annotations
+
+import os
+import pickle
+import signal
+import socket
+import struct
+import sys
+import time
+import traceback
+
+_BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BUNDLE_DIR not in sys.path:
+    sys.path.insert(0, _BUNDLE_DIR)
+_REPO_ROOT = os.path.dirname(_BUNDLE_DIR)
+
+# kicad_rl_router.so resolution — the same env-var contract the client uses
+# (the client's sys.path is not inherited).
+_RL_MODULE_DIR = os.environ.get("PCBWORLD_KICAD_RL_MODULE_DIR")
+if _RL_MODULE_DIR:
+    _RL_LIB_PATH = _RL_MODULE_DIR
+else:
+    _RL_LIB_PATH = os.path.join(
+        os.environ.get("PCBWORLD_KICAD_RL_BUILD_DIR",
+                       os.path.join(_REPO_ROOT, "build_rl")),
+        "pcbnew", "python", "rl")
+if os.path.isdir(_RL_LIB_PATH) and _RL_LIB_PATH not in sys.path:
+    sys.path.insert(0, _RL_LIB_PATH)
+
+from crash_diag import install_crash_handler, remove_log_if_empty  # noqa: E402  (bundle-local)
+from wire import (  # noqa: E402  (bundle-local — see _BUNDLE_DIR above)
+    KRL_CONSTANT_NAMES,
+    KRL_FIELDS,
+    from_wire,
+    to_wire,
+)
+
+_LEN = struct.Struct(">Q")
+PROTOCOL_VERSION = 2
+
+
+
+def _send(sock: socket.socket, obj) -> None:
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    sock.sendall(_LEN.pack(len(data)) + data)
+
+
+def _recv(sock: socket.socket):
+    hdr = _recv_exact(sock, _LEN.size)
+    if hdr is None:
+        return None
+    (n,) = _LEN.unpack(hdr)
+    data = _recv_exact(sock, n)
+    if data is None:
+        return None
+    return pickle.loads(data)
+
+
+def _recv_exact(sock: socket.socket, n: int):
+    chunks = []
+    while n:
+        try:
+            b = sock.recv(min(n, 1 << 20))
+        except ConnectionError:
+            return None
+        if not b:
+            return None
+        chunks.append(b)
+        n -= len(b)
+    return b"".join(chunks)
+
+
+def _validate_schema(krl) -> None:
+    """Fail loudly at startup if the live binding drifted from the registry."""
+    mismatches = []
+    for tname, fields in KRL_FIELDS.items():
+        cls = getattr(krl, tname, None)
+        if cls is None:
+            mismatches.append(f"{tname}: missing in binding")
+            continue
+        live = {n for n in dir(cls) if not n.startswith("_")}
+        if set(fields) != live:
+            mismatches.append(
+                f"{tname}: registry-only={sorted(set(fields) - live)} "
+                f"binding-only={sorted(live - set(fields))}")
+    missing_consts = [c for c in KRL_CONSTANT_NAMES if not hasattr(krl, c)]
+    if missing_consts:
+        mismatches.append(f"constants missing in binding: {missing_consts}")
+    if mismatches:
+        raise RuntimeError(
+            "engine server: wire schema drifted from live binding — update "
+            "wire.py (both copies):\n  " + "\n  ".join(mismatches))
+
+
+def _plain_to_native(krl, value):
+    """Convert plain mirror args (DesignRules/NetClassInfo) to native objects.
+
+    Everything else passes through — the binding surface takes only
+    primitives apart from ``set_design_rules``.
+    """
+    tname = type(value).__name__
+    if tname == "DesignRules":
+        native = krl.DesignRules()
+        for f in KRL_FIELDS["DesignRules"]:
+            v = getattr(value, f)
+            if f == "default_netclass":
+                v = _plain_to_native(krl, v)
+            elif f == "netclasses":
+                v = [_plain_to_native(krl, n) for n in v]
+            setattr(native, f, v)
+        return native
+    if tname == "NetClassInfo":
+        native = krl.NetClassInfo()
+        for f in KRL_FIELDS["NetClassInfo"]:
+            setattr(native, f, getattr(value, f))
+        return native
+    if isinstance(value, list):
+        return [_plain_to_native(krl, v) for v in value]
+    return value
+
+
+class _EngineHost:
+    """One RLRouter (at most) + request dispatch."""
+
+    def __init__(self, krl):
+        self.krl = krl
+        self.router = None
+
+    # --- ops ---
+
+    def construct(self, kwargs: dict) -> dict:
+        if self.router is not None:
+            raise RuntimeError(
+                "engine server: construct while a router is live — KiCad "
+                "global state allows one router per process; close_router "
+                "first")
+        # Strict load contract (develop v0.28+): open the SOURCE file directly,
+        # no upgrade/normalize cache. The post-load contract checks
+        # (was_legacy_design_settings_loaded / was_project_loaded_from_file /
+        # allow_default_rules) run ENV-SIDE through ordinary proxy calls.
+        board_path = kwargs["board_path"]
+        self.router = self.krl.RLRouter(
+            str(board_path),
+            kwargs.get("project_path") or "",
+            int(kwargs.get("seed", -1)),
+            int(kwargs.get("shove_iter_limit", 250)),
+            int(kwargs.get("followbranch_iter_limit", 1_000_000)),
+        )
+        return {"board_path": str(board_path)}
+
+    def close_router(self) -> None:
+        r, self.router = self.router, None
+        if r is not None:
+            try:
+                if r.is_routing():
+                    r.cancel_route()
+                if r.is_dragging():
+                    r.cancel_drag()
+            finally:
+                r = None
+
+    def call(self, name: str, args, kwargs=None) -> object:
+        if self.router is None:
+            raise RuntimeError(
+                f"engine server: call({name!r}) before construct")
+        fn = getattr(self.router, name)
+        return fn(
+            *[_plain_to_native(self.krl, from_wire(a)) for a in args],
+            **{k: _plain_to_native(self.krl, from_wire(v))
+               for k, v in (kwargs or {}).items()})
+
+    def dispatch(self, op: str, payload):
+        if op == "call":
+            name, args, kwargs = payload
+            return to_wire(self.call(name, args, kwargs))
+        if op == "batch":
+            return [to_wire(self.call(name, args, kwargs))
+                    for name, args, kwargs in payload]
+        if op == "construct":
+            return self.construct(payload)
+        if op == "close_router":
+            self.close_router()
+            return None
+        if op == "module_call":
+            name, args = payload
+            return to_wire(getattr(self.krl, name)(*[from_wire(a) for a in args]))
+        if op == "ping":
+            return "pong"
+        raise RuntimeError(f"engine server: unknown op {op!r}")
+
+
+PENDING_NAME = "s.pending"   # short: AF_UNIX paths are capped at ~107 bytes
+
+
+def _listen_published(sock_path: str) -> socket.socket:
+    """Bind + listen on a private name, then rename to ``sock_path``.
+
+    The client polls for ``sock_path`` and connects the instant it appears.
+    ``bind()`` creates the file but only ``listen()`` makes it accept
+    connections, so binding on the final name opens a window in which a
+    connect() is refused (seen once per ~1e5 spawns under load: the client
+    raised ConnectionRefusedError and this process idled in accept()).
+    rename(2) is atomic, so the final name never exists un-listened.
+    """
+    pending = os.path.join(os.path.dirname(sock_path), PENDING_NAME)
+    for p in (sock_path, pending):
+        if os.path.lexists(p):
+            os.unlink(p)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(pending)
+    srv.listen(1)
+    os.rename(pending, sock_path)
+    return srv
+
+
+ACCEPT_TIMEOUT_S = 60.0      # the client connects the instant s.sock appears
+
+
+def _accept_or_die(srv: socket.socket, sock_path: str, parent: int) -> socket.socket:
+    """accept() that gives up when no client can ever come.
+
+    A plain accept() blocks forever, so a client that dies (or raises)
+    between spawning this process and connecting leaves an orphan server
+    holding its /tmp dir. Two exits: the parent process is no longer
+    ``parent`` (the spawning client is gone — we were re-parented), or no
+    client connected within ACCEPT_TIMEOUT_S (the client waits at most for
+    the socket path, then connects at once, so a long-unconnected socket
+    is abandoned).
+    """
+    deadline = time.monotonic() + ACCEPT_TIMEOUT_S
+    srv.settimeout(1.0)
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            reparented = os.getppid() != parent
+            if reparented or time.monotonic() > deadline:
+                # The reason lands in the client's stderr capture (it reads
+                # through its own handle, so unlinking the file is fine).
+                print("engine server: exiting before any client connected — "
+                      + ("spawning client is gone" if reparented else
+                         f"none within {ACCEPT_TIMEOUT_S:.0f} s"),
+                      file=sys.stderr, flush=True)
+                _cleanup_ipc_dir(sock_path)
+                remove_log_if_empty()
+                sys.exit(0)
+            continue
+        conn.settimeout(None)
+        return conn
+
+
+def _cleanup_ipc_dir(sock_path: str) -> None:
+    """Best-effort removal of the client-created ``/tmp/krl_ipc_*`` dir.
+
+    Clients that exit without killing their servers leave the dir behind
+    (multiprocessing workers skip atexit via os._exit; kill -9): on EOF /
+    SIGTERM this process is the last one standing, so it removes its own
+    socket dir. Guarded to ``krl_ipc_`` basenames so a manually chosen
+    socket path never gets its parent dir deleted. The client's ``kill()``
+    performs the same removal — every unlink/rmdir is OSError-guarded on
+    both sides, so the double cleanup is race-free.
+    """
+    d = os.path.dirname(os.path.abspath(sock_path))
+    if not os.path.basename(d).startswith("krl_ipc_"):
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        return
+    for p in (sock_path, os.path.join(d, PENDING_NAME),
+              os.path.join(d, "server_stderr.log")):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+
+
+def main(sock_path: str, client_pid: int | None = None) -> None:
+    # The spawning client passes its pid: getppid() sampled here is already
+    # stale when the client died before we got this far (re-parented).
+    parent = client_pid if client_pid is not None else os.getppid()
+    install_crash_handler(role="engine_server")
+
+    import kicad_rl_router as krl
+
+    _validate_schema(krl)
+
+    from thread_cap import apply_thread_pool_cap
+    apply_thread_pool_cap(krl)
+
+    def _on_sigterm(*_a):
+        _cleanup_ipc_dir(sock_path)
+        remove_log_if_empty()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)   # before bind: no pending-file litter
+
+    srv = _listen_published(sock_path)
+
+    conn = _accept_or_die(srv, sock_path, parent)
+    srv.close()
+    host = _EngineHost(krl)
+    _send(conn, {
+        "protocol": PROTOCOL_VERSION,
+        "schema": KRL_FIELDS,
+        "constants": {c: getattr(krl, c) for c in KRL_CONSTANT_NAMES},
+        "pid": os.getpid(),
+    })
+
+    while True:
+        msg = _recv(conn)
+        if msg is None:          # client gone → die with it
+            break
+        op, payload = msg
+        try:
+            value = host.dispatch(op, payload)
+            reply = {"ok": True, "value": value}
+        except SystemExit:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — ship the error to the client
+            reply = {"ok": False, "etype": type(exc).__name__,
+                     "msg": str(exc), "tb": traceback.format_exc()}
+        _send(conn, reply)
+
+    host.close_router()
+    conn.close()
+    _cleanup_ipc_dir(sock_path)
+    remove_log_if_empty()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)

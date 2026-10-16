@@ -31,6 +31,8 @@
 #include <cleanup_item.h>
 #include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
+#include <pad.h>
+#include <pcb_track.h>
 #include <thread_pool.h>
 #include <lset.h>
 #include <tool/tool_manager.h>
@@ -197,7 +199,7 @@ void TRACKS_CLEANER::removeShortingTrackSegments()
                     item = std::make_shared<CLEANUP_ITEM>( CLEANUP_SHORTING_TRACK );
 
                 item->SetItems( segment );
-                m_itemsList->push_back( item );
+                m_itemsList->push_back( std::move( item ) );
 
                 toRemove.insert( segment );
             }
@@ -215,7 +217,7 @@ void TRACKS_CLEANER::removeShortingTrackSegments()
                     item = std::make_shared<CLEANUP_ITEM>( CLEANUP_SHORTING_TRACK );
 
                 item->SetItems( segment );
-                m_itemsList->push_back( item );
+                m_itemsList->push_back( std::move( item ) );
 
                 toRemove.insert( segment );
             }
@@ -307,7 +309,7 @@ bool TRACKS_CLEANER::deleteDanglingTracks( bool aTrack, bool aVia )
                     item = std::make_shared<CLEANUP_ITEM>( CLEANUP_DANGLING_TRACK );
 
                 item->SetItems( track );
-                m_itemsList->push_back( item );
+                m_itemsList->push_back( std::move( item ) );
                 track->SetFlags( IS_DELETED );
 
                 // keep iterating, because a track connected to the deleted track
@@ -349,7 +351,7 @@ void TRACKS_CLEANER::deleteTracksInPads()
             if( pad->HitTest( track->GetStart() ) && pad->HitTest( track->GetEnd() ) )
             {
                 SHAPE_POLY_SET poly;
-                track->TransformShapeToPolygon( poly, track->GetLayer(), 0, ARC_HIGH_DEF,
+                track->TransformShapeToPolygon( poly, track->GetLayer(), 0, track->GetMaxError(),
                                                 ERROR_INSIDE );
 
                 poly.BooleanSubtract( *pad->GetEffectivePolygon( track->GetLayer(), ERROR_INSIDE ) );
@@ -358,7 +360,7 @@ void TRACKS_CLEANER::deleteTracksInPads()
                 {
                     auto item = std::make_shared<CLEANUP_ITEM>( CLEANUP_TRACK_IN_PAD );
                     item->SetItems( track );
-                    m_itemsList->push_back( item );
+                    m_itemsList->push_back( std::move( item ) );
 
                     toRemove.insert( track );
                     track->SetFlags( IS_DELETED );
@@ -419,7 +421,7 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
                         {
                             auto item = std::make_shared<CLEANUP_ITEM>( CLEANUP_REDUNDANT_VIA );
                             item->SetItems( via );
-                            m_itemsList->push_back( item );
+                            m_itemsList->push_back( std::move( item ) );
 
                             via->SetFlags( IS_DELETED );
                             toRemove.insert( via );
@@ -438,7 +440,7 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
                 {
                     auto item = std::make_shared<CLEANUP_ITEM>( CLEANUP_REDUNDANT_VIA );
                     item->SetItems( via, pad );
-                    m_itemsList->push_back( item );
+                    m_itemsList->push_back( std::move( item ) );
 
                     via->SetFlags( IS_DELETED );
                     toRemove.insert( via );
@@ -455,7 +457,7 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
             {
                 auto item = std::make_shared<CLEANUP_ITEM>( CLEANUP_ZERO_LENGTH_TRACK );
                 item->SetItems( track );
-                m_itemsList->push_back( item );
+                m_itemsList->push_back( std::move( item ) );
 
                 track->SetFlags( IS_DELETED );
                 toRemove.insert( track );
@@ -485,7 +487,7 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
                         {
                             auto item = std::make_shared<CLEANUP_ITEM>( CLEANUP_DUPLICATE_TRACK );
                             item->SetItems( track );
-                            m_itemsList->push_back( item );
+                            m_itemsList->push_back( std::move( item ) );
 
                             track->SetFlags( IS_DELETED );
                             toRemove.insert( track );
@@ -525,7 +527,9 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
                     continue;
 
                 // for each end of the segment:
-                for( CN_ITEM* citem : connectivity->ItemEntry( segment ).GetItems() )
+                auto& cnItems = connectivity->ItemEntry( segment ).GetItems();
+
+                for( CN_ITEM* citem : cnItems )
                 {
                     // Do not merge an end which has different width tracks attached -- it's a
                     // common use-case for necking-down a track between pads.
@@ -591,7 +595,7 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
         // and extract all of the pairs of segments that might be merged.  Then, perform
         // the actual merge in the main loop.
         thread_pool& tp = GetKiCadThreadPool();
-        auto merge_returns = tp.parallelize_loop( 0, m_brd->Tracks().size(), track_loop );
+        auto merge_returns = tp.submit_blocks( 0, m_brd->Tracks().size(), track_loop );
         bool retval = false;
 
         for( size_t ii = 0; ii < merge_returns.size(); ++ii )
@@ -622,6 +626,11 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
             while( !m_brd->BuildConnectivity() )
                 wxSafeYield();
 
+
+            // BuildConnectivity adds items but doesn't establish their connections.
+            // RecalculateRatsnest performs the connectivity search that links them.
+            m_brd->GetConnectivity()->RecalculateRatsnest();
+
             std::lock_guard lock( m_mutex );
             m_connectedItemsCache.clear();
         } while( mergeSegments( m_brd->GetConnectivity()->GetConnectivityAlgo() ) );
@@ -634,17 +643,12 @@ void TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegment
 
 const std::vector<BOARD_CONNECTED_ITEM*>& TRACKS_CLEANER::getConnectedItems( PCB_TRACK* aTrack )
 {
-    static const std::vector<KICAD_T> connectedTypes = { PCB_TRACE_T,
-                                                         PCB_ARC_T,
-                                                         PCB_VIA_T,
-                                                         PCB_PAD_T,
-                                                         PCB_ZONE_T };
 
     const std::shared_ptr<CONNECTIVITY_DATA>& connectivity = m_brd->GetConnectivity();
     std::lock_guard                           lock( m_mutex );
 
     if( !m_connectedItemsCache.contains( aTrack ) )
-        m_connectedItemsCache[aTrack] = connectivity->GetConnectedItems( aTrack, connectedTypes );
+        m_connectedItemsCache[aTrack] = connectivity->GetConnectedItems( aTrack );
 
     return m_connectedItemsCache.at( aTrack );
 }
@@ -796,7 +800,7 @@ bool TRACKS_CLEANER::mergeCollinearSegments( PCB_TRACK* aSeg1, PCB_TRACK* aSeg2 
 
     std::shared_ptr<CLEANUP_ITEM> item = std::make_shared<CLEANUP_ITEM>( CLEANUP_MERGE_TRACKS );
     item->SetItems( aSeg1, aSeg2 );
-    m_itemsList->push_back( item );
+    m_itemsList->push_back( std::move( item ) );
 
     aSeg2->SetFlags( IS_DELETED );
 
@@ -804,7 +808,7 @@ bool TRACKS_CLEANER::mergeCollinearSegments( PCB_TRACK* aSeg1, PCB_TRACK* aSeg2 
     {
         m_commit.Modify( aSeg1 );
 
-        PCB_GROUP* group = aSeg1->GetParentGroup();
+        EDA_GROUP* group = aSeg1->GetParentGroup();
         *aSeg1 = dummy_seg;
         aSeg1->SetParentGroup( group );
 

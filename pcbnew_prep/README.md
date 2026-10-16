@@ -8,13 +8,13 @@ absolute constants replaced by required env vars.
 
 The unified runner does **not** call these at runtime — they must be executed
 once per dataset on a host where the system Python's `pcbnew` module is
-available (typical KiCad install on Ubuntu / a CI image with KiCad 9).
+available (typical KiCad 10.0.7 install on Ubuntu / a CI image with KiCad 10.0.7).
 
 ## Scripts
 
 | Script | Target | Env vars |
 |---|---|---|
-| `make_dsn_orp_v3.py` | pcbench (`exacad_sorted`) | `PCBENCH_PCB_ROOT`, `PCBENCH_DSN_ROOT` |
+| `make_dsn_orp_v3.py` | pcbench v10 (`exacad_sorted_v10`, `processed_v10_guide_v3`) | `PCBENCH_PCB_ROOT`, `PCBENCH_DSN_ROOT` |
 | `make_dsn_orp_synth.py` | synth_2L_v2 | `SYNTH2L_PCB_ROOT`, `SYNTH2L_DSN_ROOT` |
 | `make_dsn_orp_synth_1l.py` | synth_1L grid50 | `SYNTH1L_PCB_ROOT`, `SYNTH1L_DSN_ROOT` |
 | `make_dsn_orp_synth_1l_g10.py` | synth_1L grid10 | (same) |
@@ -43,10 +43,10 @@ the build was configured with. A host KiCad install
 ## Typical invocation
 
 ```bash
-# pcbench
-export PCBENCH_PCB_ROOT=$PCBWORLD_DATA_ROOT/pcbench/exacad_sorted
-export PCBENCH_DSN_ROOT=$PCBWORLD_DATA_ROOT/pcbench/exacad_sorted_dsn
-/usr/bin/python3 pcbnew_prep/make_dsn_orp_v3.py            # all 679 folders
+# pcbench v10
+export PCBENCH_PCB_ROOT=$PCBWORLD_DATA_ROOT/pcbench/exacad_sorted_v10
+export PCBENCH_DSN_ROOT=$PCBWORLD_DATA_ROOT/pcbench/exacad_sorted_dsn_v10
+/usr/bin/python3 pcbnew_prep/make_dsn_orp_v3.py            # all v10 folders
 /usr/bin/python3 pcbnew_prep/make_dsn_orp_v3.py --limit 5  # smoke
 
 # synth_2L_v2
@@ -80,7 +80,7 @@ export SYNTH1L_DSN_ROOT=$PCBWORLD_DATA_ROOT/synthetic/synth_1L_grid50_5net_v02_d
 
 | dataset | pre-converted DSN+ORP | location |
 |---|---|---|
-| pcbench (679 folders) | required by the runner | `pcbench/exacad_sorted_dsn/` |
+| pcbench v10 | required by the runner | `pcbench/exacad_sorted_dsn_v10/` |
 | synth_2L_v2/test (128 boards) | required by the runner | `synthetic/synth_2L_v2_dsn/test/` |
 | synth_1L_grid{10,50,100,200,500}/test | optional | `synthetic/synth_1L_grid<G>_5net_v02_dsn/` |
 | synth_1L_grid1000 | run prep script first | — |

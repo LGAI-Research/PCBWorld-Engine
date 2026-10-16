@@ -90,15 +90,15 @@
 -    void SetParent( BOARD_ITEM* aParent )
 -    {
 -        m_parent = aParent;
--
--        if( m_parent )
--            m_sourceItem = m_parent;
--    }
 +    // PCBWorld-mod begin 2026-09-10
 +    // Defined out-of-line (pns_item.cpp): it caches the parent's KIID, which needs
 +    // BOARD_ITEM's definition, and this header only forward-declares it.
 +    void SetParent( BOARD_ITEM* aParent );
  
+-        if( m_parent )
+-            m_sourceItem = m_parent;
+-    }
+-
      BOARD_ITEM* Parent() const { return m_parent; }
  
 +    /**

@@ -126,7 +126,7 @@ PNS_RL_ROUTER::PNS_RL_ROUTER( const std::string& board_path,
     // then preserves those values by calling SetParent(&project, false).
     m_projectPath = resolveProjectPath( board_path, project_path );
 
-    m_settingsMgr = std::make_unique<SETTINGS_MANAGER>( /*aHeadless=*/true );
+    m_settingsMgr = std::make_unique<SETTINGS_MANAGER>();
 
     // LoadProject still registers a fresh in-memory PROJECT under
     // m_projectPath even when the file is missing/unreadable, so Prj() is
@@ -1481,12 +1481,12 @@ void PNS_RL_ROUTER::runDRCEngine( const std::string& rules_path,
 
     engine->SetViolationHandler(
         [&]( const std::shared_ptr<DRC_ITEM>& aItem, const VECTOR2I& aPos,
-             int aLayer, DRC_CUSTOM_MARKER_HANDLER* )
+             int aLayer, const std::function<void( PCB_MARKER* )>& )
         {
             RLDRCViolation v;
             v.error_code = aItem->GetErrorCode();
-            v.message    = aItem->GetErrorMessage().ToStdString();
-            v.error_type = aItem->GetErrorText().ToStdString();
+            v.message    = aItem->GetErrorMessage( true ).ToStdString();
+            v.error_type = aItem->GetErrorText( true ).ToStdString();
             v.x_mm       = mmFromNm( aPos.x );
             v.y_mm       = mmFromNm( aPos.y );
             v.layer      = aLayer;
@@ -1497,7 +1497,7 @@ void PNS_RL_ROUTER::runDRCEngine( const std::string& rules_path,
             {
                 if( id == niluuid )
                     return {};
-                EDA_ITEM* ei = m_board->GetItem( id );
+                EDA_ITEM* ei = m_board->ResolveItem( id, true );
                 if( !ei )
                     return {};
                 BOARD_CONNECTED_ITEM* bci = dynamic_cast<BOARD_CONNECTED_ITEM*>( ei );
@@ -1514,8 +1514,8 @@ void PNS_RL_ROUTER::runDRCEngine( const std::string& rules_path,
 
             // Stable UUID keys (values, not pointers) for incremental DRC
             // invalidation: compare against the removed/changed track set without
-            // dereferencing anything. Resolve to a live item via
-            // m_board->GetItem(kiid) only when needed (null-safe).
+            // dereferencing anything. Resolve through BOARD::ResolveItem only when needed
+            // (null-safe).
             v.item_a = aItem->GetMainItemID();
             v.item_b = aItem->GetAuxItemID();
 
@@ -2270,10 +2270,14 @@ std::vector<RLClusterPoint> PNS_RL_ROUTER::getConnectedPoints( double x_mm, doub
     // GetConnectedItems() returns the seed's ENTIRE cluster (transitive, scoped
     // to its net), not just direct neighbours — connectivity_data.cpp resolves
     // it through SearchClusters + CN_CLUSTER::Contains.
-    static const std::vector<KICAD_T> types = { PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_PAD_T };
+    for( BOARD_CONNECTED_ITEM* item : connectivity->GetConnectedItems( seed ) )
+    {
+        if( item->Type() != PCB_TRACE_T && item->Type() != PCB_ARC_T
+            && item->Type() != PCB_VIA_T && item->Type() != PCB_PAD_T )
+            continue;
 
-    for( BOARD_CONNECTED_ITEM* item : connectivity->GetConnectedItems( seed, types ) )
         appendClusterPoints( item, result );
+    }
 
     return result;
 }

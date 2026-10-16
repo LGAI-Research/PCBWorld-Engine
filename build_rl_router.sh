@@ -13,6 +13,7 @@ else
 fi
 BUILD_DIR="${BUILD_DIR:-${HOST_ROOT}/build_rl}"
 KICAD_SRC_ORIG="${BUNDLE_DIR}/kicad-python/kicad"
+KICAD_SOURCE_COMMIT=69cafb907ebc09e7722a2a464b1d466fc2e3608d
 KICAD_SRC="${BUILD_DIR}/kicad_src"
 PATCHES_DIR="${BUNDLE_DIR}/kicad-patches"
 VENV_DIR="${VENV_DIR:-${HOST_ROOT}/.venv}"
@@ -119,8 +120,23 @@ if [ ! -f "$KICAD_SRC_ORIG/CMakeLists.txt" ]; then
     exit 1
 fi
 
+# kicad-python is an upstream submodule whose own nested kicad gitlink is outside this
+# repository's index. Enforce the exact source commit here; never build its older default.
+if [ "$(git -C "$KICAD_SRC_ORIG" rev-parse HEAD)" != "$KICAD_SOURCE_COMMIT" ]; then
+    if [ -n "$(git -C "$KICAD_SRC_ORIG" status --porcelain)" ]; then
+        echo "ERROR: $KICAD_SRC_ORIG has local changes; refusing to replace its KiCad source"
+        exit 1
+    fi
+    git -C "$KICAD_SRC_ORIG" fetch --depth=1 origin "$KICAD_SOURCE_COMMIT"
+    git -C "$KICAD_SRC_ORIG" checkout --detach "$KICAD_SOURCE_COMMIT"
+fi
+if [ "$(git -C "$KICAD_SRC_ORIG" rev-parse HEAD)" != "$KICAD_SOURCE_COMMIT" ]; then
+    echo "ERROR: KiCad source is not pinned to $KICAD_SOURCE_COMMIT"
+    exit 1
+fi
+
 # ──────────────────────────────────────────────
-# Step 1: rsync source -> build directory (kicad-python/ is left unmodified)
+# Step 1: enforce KiCad source pin, then rsync source -> build directory
 # ──────────────────────────────────────────────
 echo ""
 echo "=== Prepare patched source ==="
@@ -155,8 +171,6 @@ echo "  Applying patches..."
 cp -p "$PATCHES_DIR/kicad/CMakeLists.txt"                       "$KICAD_SRC/CMakeLists.txt"
 cp -p "$PATCHES_DIR/kicad/cmake/FindOCC.cmake"                  "$KICAD_SRC/cmake/FindOCC.cmake"
 cp -p "$PATCHES_DIR/kicad/common/build_version.cpp"             "$KICAD_SRC/common/build_version.cpp"
-cp -p "$PATCHES_DIR/kicad/common/properties/pg_properties.cpp"  "$KICAD_SRC/common/properties/pg_properties.cpp"
-cp -p "$PATCHES_DIR/kicad/include/properties/pg_properties.h"   "$KICAD_SRC/include/properties/pg_properties.h"
 # kiid: expose KIID::Get/SetGeneratorState so the RL checkpoint can snapshot and the
 # restore can rewind the process-global UUID generator — makes routing replayed after
 # a checkpoint restore mint the same UUID stream a fresh run does.
@@ -207,9 +221,8 @@ cp -p "$PATCHES_DIR/kicad/pcbnew/router/pns_router.cpp"         "$KICAD_SRC/pcbn
 # diagnostic message and aborts (loud-fail) instead of segfaulting randomly.
 # Paired with the destructor guard in pns_router.cpp (if theRouter==this).
 cp -p "$PATCHES_DIR/kicad/pcbnew/router/pns_mouse_trail_tracer.cpp" "$KICAD_SRC/pcbnew/router/pns_mouse_trail_tracer.cpp"
-# pns_topology: sorts CLUSTER::m_items by UUID (std::set<ITEM*,ItemCmp>) so
-# the processCluster accumulation order in walkaround/shove is
-# deterministic, removing ASLR-based rollout nondeterminism.
+# pns_topology: sorts KiCad 10's vector CLUSTER::m_items by canonical item order
+# before processing, making walkaround/shove accumulation deterministic.
 # .cpp: replaces followBranch's wall-clock timeout (m_FollowBranchTimeout)
 # with a deterministic pop counter, so a time cutoff no longer interrupts
 # DFS at a different point on every run.
@@ -226,10 +239,9 @@ cp -p "$PATCHES_DIR/kicad/pcbnew/ratsnest/ratsnest_data.cpp"    "$KICAD_SRC/pcbn
 #     DRC baseline) need every violation, and the cap also misfiles shorts as
 #     clearance violations once the shorting budget is spent.
 cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_engine.cpp"           "$KICAD_SRC/pcbnew/drc/drc_engine.cpp"
-# drc_rtree.h: DRC_RTREE::clear() deletes the ITEM_WITH_SHAPE entries it drops (upstream
-# leaks them; the hole-to-hole provider is a singleton that clear()s per run, so every
-# DRC pass leaked ~13 KB for the life of the process; KiCad 9.0.8 upstream bug).
-cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_rtree.h"                "$KICAD_SRC/pcbnew/drc/drc_rtree.h"
+# Keep creepage path search inline when it is called by this same pool's worker, avoiding
+# nested-future starvation without dropping DRC marker paths or violations.
+cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_creepage_utils.cpp" "$KICAD_SRC/pcbnew/drc/drc_creepage_utils.cpp"
 # Two related layer fixes:
 #   pns_joint.h: JOINT::operator== now includes the layer range (removes a
 #     latent stacked-joint confusion trap).
@@ -238,18 +250,16 @@ cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_rtree.h"                "$KICAD_SRC/pcb
 #     different layer across a via.
 cp -p "$PATCHES_DIR/kicad/pcbnew/router/pns_joint.h"            "$KICAD_SRC/pcbnew/router/pns_joint.h"
 cp -p "$PATCHES_DIR/kicad/pcbnew/tracks_cleaner.cpp"            "$KICAD_SRC/pcbnew/tracks_cleaner.cpp"
-mkdir -p "$KICAD_SRC/kicad/cli"
-cp -p "$PATCHES_DIR/kicad/kicad/cli/command_pcb_render.cpp"     "$KICAD_SRC/kicad/cli/command_pcb_render.cpp"
 
 # New RL files
 cp -p "$PATCHES_DIR/rl/pns_rl_router.cpp"    "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_router.h"      "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_iface.cpp"     "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_iface.h"       "$KICAD_SRC/pcbnew/router/"
-# RL DRC (tag: _rl_): the stock DRC files are left PRISTINE. Our copper-clearance fork
-# (event-driven wait + incremental clearance scope) is dropped in alongside them and
-# compiled INSTEAD of the original by kicad-patches/rl/CMakeLists.txt's DRC_SRCS. The
-# scope plumbing lives in a thread_local (drc_rl_scope.h), so no core DRC file is touched.
+# RL DRC (tag: _rl_): the stock DRC provider files stay pristine. Our copper-clearance fork
+# (event-driven wait + incremental scope) is dropped in alongside them and compiled INSTEAD
+# of the stock provider by kicad-patches/rl/CMakeLists.txt. The shared creepage graph helper
+# is overlaid above only to avoid nested work submitted back to its caller's thread pool.
 cp -p "$PATCHES_DIR/rl/drc_test_provider_rl_copper_clearance.cpp" "$KICAD_SRC/pcbnew/drc/"
 cp -p "$PATCHES_DIR/rl/drc_rl_scope.cpp"     "$KICAD_SRC/pcbnew/drc/"
 cp -p "$PATCHES_DIR/rl/drc_rl_scope.h"       "$KICAD_SRC/pcbnew/drc/"
@@ -263,7 +273,7 @@ cp -p "$PATCHES_DIR/rl/CMakeLists.txt"       "$KICAD_SRC/pcbnew/python/rl/"
 cp -p "$PATCHES_DIR/rl/tracks_cleaner_rl.cpp" "$KICAD_SRC/pcbnew/"
 cp -p "$PATCHES_DIR/rl/tracks_cleaner_rl.h"   "$KICAD_SRC/pcbnew/"
 
-echo "  Done (24 files patched)"
+echo "  Done (29 KiCad source overlays, 12 RL source files)"
 
 # ──────────────────────────────────────────────
 # Step 3: CMake Configure
@@ -340,8 +350,9 @@ echo ""
 # kicad_rl_router is the only target the core RL/DRC pipeline needs.
 # kicad-cli is optional: only envs/rendering (SVG/PDF/3D) shells out to it.
 # Gate with BUILD_CLI=1.
+# Its plugin manager needs the API schema staged in the build tree for headless commands.
 NINJA_TARGETS="kicad_rl_router"
-[ "$BUILD_CLI"       = "1" ] && NINJA_TARGETS="$NINJA_TARGETS kicad-cli"
+[ "$BUILD_CLI"       = "1" ] && NINJA_TARGETS="$NINJA_TARGETS kicad-cli api_schema_build_copy"
 [ "$BUILD_PCBNEW"    = "1" ] && NINJA_TARGETS="$NINJA_TARGETS pcbnew_kiface pcbnew_python_module"
 echo "=== Build targets: $NINJA_TARGETS ==="
 ninja $NINJA_TARGETS
@@ -353,10 +364,15 @@ ninja $NINJA_TARGETS
 # already-installed CLI-free build tree.
 # ──────────────────────────────────────────────
 CLI_BUILT="${BUILD_DIR}/kicad/kicad-cli"
-CLI_DEST_DIR="${BUILD_DIR}/kicad/KiCad.app/Contents/MacOS"
-if [ "$BUILD_CLI" = "1" ] && [ -x "$CLI_BUILT" ]; then
-    mkdir -p "$CLI_DEST_DIR"
-    cp -f "$CLI_BUILT" "$CLI_DEST_DIR/kicad-cli"
+CLI_BUNDLE="${BUILD_DIR}/kicad/KiCad.app/Contents/MacOS/kicad-cli"
+if [ "$BUILD_CLI" = "1" ] && [ "$(uname -s)" = "Darwin" ]; then
+    if [ -x "$CLI_BUNDLE" ]; then
+        CLI_BUILT="$CLI_BUNDLE"
+    elif [ -x "$CLI_BUILT" ]; then
+        mkdir -p "$(dirname "$CLI_BUNDLE")"
+        cp -f "$CLI_BUILT" "$CLI_BUNDLE"
+        CLI_BUILT="$CLI_BUNDLE"
+    fi
 fi
 
 # ──────────────────────────────────────────────
@@ -404,7 +420,9 @@ echo "engine C++ content: $CPP_HASH (stamped next to module)"
 
 echo ""
 echo "Usage:"
-echo "  export DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}'"
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "  export DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}'"
+fi
 PYTHONPATH_HINT="${BUILD_DIR}/pcbnew/python/rl"
 if [ "$BUILD_PCBNEW" = "1" ] && [ -n "${PCBNEW_SITE:-}" ]; then
     PYTHONPATH_HINT="${PYTHONPATH_HINT}:${PCBNEW_SITE}"
@@ -412,7 +430,7 @@ fi
 echo "  export PYTHONPATH='${PYTHONPATH_HINT}'"
 echo "  python3 -c 'import kicad_rl_router; print(\"OK\")'"
 if [ "$BUILD_PCBNEW" = "1" ]; then
-    echo "  python3 -c 'import pcbnew; print(pcbnew.GetBuildVersion())'"
+    echo "  KICAD_RUN_FROM_BUILD_DIR=1 python3 -c 'import pcbnew; print(pcbnew.GetBuildVersion())'"
 fi
 if [ "$BUILD_CLI" = "1" ]; then
     # A kicad-cli run from the build tree finds _pcbnew.kiface (one directory up, in
@@ -420,5 +438,13 @@ if [ "$BUILD_CLI" = "1" ]; then
     echo "  KICAD_RUN_FROM_BUILD_DIR=1 '${CLI_BUILT}' --version"
 fi
 echo ""
-echo "Test:"
-echo "  DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}' pytest tests/ -v"
+echo "Test (from PCBWorld root):"
+if [ -d "${HOST_ROOT}/tests/test_engine_api" ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "  (cd '${HOST_ROOT}' && DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}' python3 -m pytest -o addopts= -v tests/test_engine_api)"
+    else
+        echo "  (cd '${HOST_ROOT}' && python3 -m pytest -o addopts= -v tests/test_engine_api)"
+    fi
+else
+    echo "  Run tests/test_engine_api from a PCBWorld environment checkout."
+fi

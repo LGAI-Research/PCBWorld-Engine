@@ -61,7 +61,8 @@ enum class CONSTRAINT_TYPE
     CT_HOLE_TO_HOLE = 9,
     CT_DIFF_PAIR_SKEW = 10,
     CT_MAX_UNCOUPLED = 11,
-    CT_PHYSICAL_CLEARANCE = 12
+    CT_PHYSICAL_CLEARANCE = 12,
+    CT_PHYSICAL_HOLE_CLEARANCE = 13
 };
 
 /**
@@ -77,6 +78,7 @@ struct CONSTRAINT
     wxString        m_RuleName;
     wxString        m_FromName;
     wxString        m_ToName;
+    bool            m_IsTimeDomain;
 };
 
 
@@ -153,6 +155,8 @@ public:
 
     virtual int Clearance( const ITEM* aA, const ITEM* aB, bool aUseClearanceEpsilon = true ) = 0;
 
+    virtual bool HasUserDefinedPhysicalConstraint() { return false; }
+
     virtual NET_HANDLE DpCoupledNet( NET_HANDLE aNet ) = 0;
     virtual int DpNetPolarity( NET_HANDLE aNet ) = 0;
     virtual bool DpNetPair( const ITEM* aItem, NET_HANDLE& aNetP, NET_HANDLE& aNetN ) = 0;
@@ -181,6 +185,14 @@ public:
     virtual void ClearTemporaryCaches() {}
 
     virtual int ClearanceEpsilon() const { return 0; }
+
+    virtual const SHAPE_LINE_CHAIN& HullCache( const ITEM* aItem, int aClearance,
+                                               int aWalkaroundThickness, int aLayer )
+    {
+        static SHAPE_LINE_CHAIN empty;
+        empty = aItem->Hull( aClearance, aWalkaroundThickness, aLayer );
+        return empty;
+    }
 };
 
 
@@ -598,7 +610,8 @@ private:
     ///< Scan the joint map, forming a line starting from segment (current).
     void followLine( LINKED_ITEM* aCurrent, bool aScanDirection, int& aPos, int aLimit,
                      VECTOR2I* aCorners, LINKED_ITEM** aSegments, bool* aArcReversed,
-                     bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments );
+                     bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments,
+                     bool aAllowSegmentSizeMismatch );
 
 private:
     struct DEFAULT_OBSTACLE_VISITOR;

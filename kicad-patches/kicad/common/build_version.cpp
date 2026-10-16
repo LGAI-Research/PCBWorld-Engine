@@ -61,6 +61,7 @@ static std::recursive_mutex s_platformInfoMutex;
 static wxString s_glVendor;
 static wxString s_glRenderer;
 static wxString s_glVersion;
+static wxString s_glBackend;
 
 void SetOpenGLInfo( const char* aVendor, const char* aRenderer, const char* aVersion )
 {
@@ -68,6 +69,12 @@ void SetOpenGLInfo( const char* aVendor, const char* aRenderer, const char* aVer
     s_glRenderer = wxString::FromUTF8( aRenderer );
     s_glVersion = wxString::FromUTF8( aVersion );
 }
+
+void SetOpenGLBackendInfo( wxString aBackend )
+{
+    s_glBackend = aBackend;
+}
+
 
 
 wxString GetPlatformGetBitnessName()
@@ -174,7 +181,27 @@ wxString GetVersionInfoData( const wxString& aTitle, bool aHtml, bool aBrief )
     aMsg << "Version: " << version << eol << eol;
     aMsg << "Libraries:" << eol;
 
-    aMsg << indent4 << wxGetLibraryVersionInfo().GetVersionString() << eol;
+    aMsg << indent4 << wxGetLibraryVersionInfo().GetVersionString() << " ";
+
+#ifdef __WXGTK__
+    #if wxCHECK_VERSION( 3, 3, 2 )
+        #if wxHAS_EGL && wxHAS_GLX
+            aMsg << "EGL/GLX";
+        #elif wxHAS_EGL
+            aMsg << "EGL";
+        #elif wxHAS_GLX
+            aMsg << "GLX";
+        #endif
+    #else
+        #if wxUSE_GLCANVAS_EGL
+            aMsg << "EGL";
+        #else
+            aMsg << "GLX";
+        #endif
+    #endif
+#endif
+
+    aMsg << eol;
 
     aMsg << indent4 << "FreeType " << KIFONT::VERSION_INFO::FreeType() << eol;
     aMsg << indent4 << "HarfBuzz " << KIFONT::VERSION_INFO::HarfBuzz() << eol;
@@ -222,16 +249,26 @@ wxString GetVersionInfoData( const wxString& aTitle, bool aHtml, bool aBrief )
         }
     }
 
-    aMsg << ", " << wxGetenv( "XDG_SESSION_DESKTOP" )
-         << ", " << wxGetenv( "XDG_SESSION_TYPE" );
+    aMsg << ", " << wxGetenv( "XDG_SESSION_TYPE" )
+         << ", " << wxGetenv( "XDG_CURRENT_DESKTOP" )
+         << ", " << wxGetenv( "XDG_SESSION_DESKTOP" );
 #endif
 
-    if( !s_glVendor.empty() || !s_glRenderer.empty() || !s_glVersion.empty() )
+    wxString glMsg;
+
+    for( const wxString& str : { s_glVendor, s_glRenderer, s_glVersion, s_glBackend } )
     {
-        aMsg << eol;
-        aMsg << "OpenGL: " << s_glVendor << ", " << s_glRenderer << ", " << s_glVersion;
+        if( str.empty() )
+            continue;
+
+        if( !glMsg.empty() )
+            glMsg << ", ";
+
+        glMsg << str;
     }
 
+    if( !glMsg.empty() )
+        aMsg << eol << "OpenGL: " << glMsg;
     aMsg << eol << eol;
 
     if( !aBrief )
@@ -306,19 +343,22 @@ wxString GetVersionInfoData( const wxString& aTitle, bool aHtml, bool aBrief )
 #endif
 
     // Add build settings config (build options):
-#if defined( KICAD_USE_EGL ) || ! defined( NDEBUG )
+#if !defined( NDEBUG )
     aMsg << eol;
     aMsg << "Build settings:" << eol;
-#endif
-
-#ifdef KICAD_USE_EGL
-    aMsg << indent4 << "KICAD_USE_EGL=" << ON;
 #endif
 
 #ifdef KICAD_IPC_API
     aMsg << indent4 << "KICAD_IPC_API=" << ON;
 #else
     aMsg << indent4 << "KICAD_IPC_API=" << OFF;
+#endif
+
+    aMsg << indent4 << "KICAD_USE_PCH=";
+#ifdef KICAD_USE_PCH
+    aMsg << ON;
+#else
+    aMsg << OFF;
 #endif
 
 #ifndef NDEBUG

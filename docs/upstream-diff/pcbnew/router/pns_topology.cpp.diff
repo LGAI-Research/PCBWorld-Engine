@@ -12,7 +12,68 @@
  
  #include <advanced_config.h>
  
-@@ -182,7 +184,19 @@
+@@ -37,7 +39,6 @@
+ 
+ #include "pns_diff_pair.h"
+ #include "pns_topology.h"
+-
+ #include "pcb_track.h"
+ 
+ #include <board.h>
+@@ -85,7 +86,7 @@
+ 
+         for( ITEM* item : current->LinkList() )
+         {
+-            if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
++            if( item->OfKind( ITEM::SEGMENT_T ) )
+             {
+                 const JOINT* a = m_world->FindJoint( item->Anchor( 0 ), item );;
+                 const JOINT* b = m_world->FindJoint( item->Anchor( 1 ), item );;
+@@ -118,32 +119,17 @@
+     track.ClearLinks();
+     tmpNode->Add( track );
+ 
+-    const JOINT* jt = tmpNode->FindJoint( track.CLastPoint(), &track );
++    const JOINT* jt = tmpNode->FindJoint( track.CPoint( -1 ), &track );
+ 
+     if( !jt || m_world->GetRuleResolver()->NetCode( jt->Net() ) <= 0 )
+        return false;
+ 
+-    ITEM* connected = nullptr;
+-
+     if( ( !track.EndsWithVia() && jt->LinkCount() >= 2 )
+             || ( track.EndsWithVia() && jt->LinkCount() >= 3 ) ) // we got something connected
+     {
+-        // tmpNode's own track is freed on return, skip it to avoid a dangling anchor item
+-        for( ITEM* link : jt->LinkList() )
+-        {
+-            if( !link->BelongsTo( tmpNode.get() ) )
+-            {
+-                connected = link;
+-                break;
+-            }
+-        }
+-    }
+-
+-    if( connected )
+-    {
+         end = jt->Pos();
+         aLayers = jt->Layers();
+-        aItem = connected;
++        aItem = jt->LinkList()[0];
+     }
+     else
+     {
+@@ -176,7 +162,7 @@
+         return false;
+ 
+     aRatLine.Clear();
+-    aRatLine.Append( aTrack->CLastPoint() );
++    aRatLine.Append( aTrack->CPoint( -1 ) );
+     aRatLine.Append( end );
+     return true;
+ }
+@@ -200,7 +186,19 @@
      int best_dist = INT_MAX;
      ITEM* best = nullptr;
  
@@ -33,7 +94,7 @@
      {
          if( item->OfKind( aKindMask ) )
          {
-@@ -211,13 +225,17 @@
+@@ -229,13 +227,17 @@
                                                std::set<ITEM*>& aVisited,
                                                bool aFollowLockedSegments )
  {
@@ -55,7 +116,7 @@
  
      // State for iterative DFS: current joint, previous item, accumulated path items,
      // accumulated length, and the set of visited joints for this path
-@@ -245,17 +263,8 @@
+@@ -263,17 +265,8 @@
  
      while( !stateStack.empty() )
      {
@@ -74,3 +135,185 @@
  
          STATE current = std::move( stateStack.top() );
          stateStack.pop();
+@@ -313,7 +306,7 @@
+             if( l.CPoint( 0 ) != joint->Pos() )
+                 l.Reverse();
+ 
+-            const JOINT* nextJoint = m_world->FindJoint( l.CLastPoint(), &l );
++            const JOINT* nextJoint = m_world->FindJoint( l.CPoint( -1 ), &l );
+ 
+             // Skip if we've already visited this joint in the current path
+             if( current.visitedJoints.count( nextJoint ) )
+@@ -366,13 +359,6 @@
+ {
+     assert( aLine2->IsLinked() );
+ 
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "=== followTrivialPath START ===" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: initial line has %d segments, %zu links" ),
+-                aLine2->SegmentCount(), aLine2->Links().size() );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: line endpoints: (%d,%d) to (%d,%d)" ),
+-                aLine2->CPoint( 0 ).x, aLine2->CPoint( 0 ).y,
+-                aLine2->CLastPoint().x, aLine2->CLastPoint().y );
+-
+     ITEM_SET path;
+     path.Add( *aLine2 );
+ 
+@@ -382,19 +368,10 @@
+         visited.insert( link );
+ 
+     const JOINT* jtA = m_world->FindJoint( aLine2->CPoint( 0 ), aLine2 );
+-    const JOINT* jtB = m_world->FindJoint( aLine2->CLastPoint(), aLine2 );
++    const JOINT* jtB = m_world->FindJoint( aLine2->CPoint( -1 ), aLine2 );
+ 
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: LEFT branch starting from joint at (%d,%d)" ),
+-                jtA->Pos().x, jtA->Pos().y );
+     PATH_RESULT left = followBranch( jtA, aLine2->Links().front(), visited, aFollowLockedSegments );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: LEFT branch result: length=%d, %d items" ),
+-                left.m_length, left.m_items.Size() );
+-
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: RIGHT branch starting from joint at (%d,%d)" ),
+-                jtB->Pos().x, jtB->Pos().y );
+     PATH_RESULT right = followBranch( jtB, aLine2->Links().back(), visited, aFollowLockedSegments );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "followTrivialPath: RIGHT branch result: length=%d, %d items" ),
+-                right.m_length, right.m_items.Size() );
+ 
+     if( aTerminalJointA )
+         *aTerminalJointA = left.m_end;
+@@ -402,58 +379,12 @@
+     if( aTerminalJointB )
+         *aTerminalJointB = right.m_end;
+ 
+-    // Count segments as we build the final path
+-    int leftSegCount = 0;
+-    int rightSegCount = 0;
+-    int initialSegCount = 0;
+-
+-    // Count initial segments
+-    for( int i = 0; i < aLine2->SegmentCount(); i++ )
+-        initialSegCount++;
+-
+-    // Add left items
+     for( ITEM* item : left.m_items )
+-    {
+         path.Prepend( item );
+-        if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+-        {
+-            LINE* l = dynamic_cast<LINE*>( item );
+-            if( l )
+-                leftSegCount += l->SegmentCount();
+-            else
+-                leftSegCount++;
+-        }
+-    }
+ 
+-    // Add right items
+     for( ITEM* item : right.m_items )
+-    {
+         path.Add( item );
+-        if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+-        {
+-            LINE* l = dynamic_cast<LINE*>( item );
+-            if( l )
+-                rightSegCount += l->SegmentCount();
+-            else
+-                rightSegCount++;
+-        }
+-    }
+-
+-    // Calculate total path length
+-    int totalLength = left.m_length + aLine2->CLine().Length() + right.m_length;
+ 
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "=== followTrivialPath SUMMARY ===" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Starting segment count: %d" ), initialSegCount );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Left branch: %d segments, length=%d" ), leftSegCount, left.m_length );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Initial line: %d segments, length=%lld" ), initialSegCount, aLine2->CLine().Length() );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Right branch: %d segments, length=%d" ), rightSegCount, right.m_length );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Total segments in path: %d" ), leftSegCount + initialSegCount + rightSegCount );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Total path length: %d" ), totalLength );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "Total items in result: %d" ), path.Size() );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "=== followTrivialPath END ===" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "" ) );
+-
+     return path;
+ }
+ 
+@@ -462,24 +393,16 @@
+                                               std::pair<const JOINT*, const JOINT*>* aTerminalJoints,
+                                               bool aFollowLockedSegments )
+ {
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "*** AssembleTrivialPath: START ***" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: aStart=%p, kind=%s" ),
+-                aStart, aStart->KindStr().c_str() );
+-
+     ITEM_SET        path;
+     LINKED_ITEM*    seg = nullptr;
+ 
+     if( aStart->Kind() == ITEM::VIA_T )
+     {
+-        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: starting from VIA" ) );
+         VIA*         via = static_cast<VIA*>( aStart );
+         const JOINT* jt  = m_world->FindJoint( via->Pos(), via );
+ 
+         if( !jt->IsNonFanoutVia() )
+-        {
+-            wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: VIA is fanout, returning empty" ) );
+             return ITEM_SET();
+-        }
+ 
+         ITEM_SET links( jt->CLinks() );
+ 
+@@ -488,7 +411,6 @@
+             if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+             {
+                 seg = static_cast<LINKED_ITEM*>( item );
+-                wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: found segment/arc from VIA" ) );
+                 break;
+             }
+         }
+@@ -496,21 +418,14 @@
+     else if( aStart->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+     {
+         seg = static_cast<LINKED_ITEM*>( aStart );
+-        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: starting from SEGMENT/ARC" ) );
+     }
+ 
+     if( !seg )
+-    {
+-        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: no segment found, returning empty" ) );
+         return ITEM_SET();
+-    }
+ 
+     // Assemble a line following through locked segments
+     // TODO: consider if we want to allow tuning lines with different widths in the future
+     LINE l = m_world->AssembleLine( seg, nullptr, false, aFollowLockedSegments );
+-
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: assembled line with %d segments, length=%lld" ),
+-                l.SegmentCount(), l.CLine().Length() );
+ 
+     const JOINT* jointA = nullptr;
+     const JOINT* jointB = nullptr;
+@@ -521,13 +436,7 @@
+     {
+         wxASSERT( jointA && jointB );
+         *aTerminalJoints = std::make_pair( jointA, jointB );
+-        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: terminal joints at (%d,%d) and (%d,%d)" ),
+-                    jointA->Pos().x, jointA->Pos().y, jointB->Pos().x, jointB->Pos().y );
+     }
+-
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTrivialPath: returning path with %d items" ), path.Size() );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "*** AssembleTrivialPath: END ***" ) );
+-    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "" ) );
+ 
+     return path;
+ }
+@@ -1208,9 +1117,7 @@
+         pending.pop_front();
+ 
+         if( processed.find( top ) == processed.end() )
+-        {
+             cluster.m_items.push_back( top );
+-        }
+ 
+         processed.insert( top );
+ 

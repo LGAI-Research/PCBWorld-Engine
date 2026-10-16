@@ -47,7 +47,6 @@ set( DRC_SRCS
     ${CMAKE_SOURCE_DIR}/pcbnew/drc/drc_cache_generator.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/drc/drc_creepage_utils.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/drc/drc_test_provider.cpp
-    ${CMAKE_SOURCE_DIR}/pcbnew/drc/drc_test_provider_clearance_base.cpp
     # RL fork of the copper-clearance provider (event-driven wait + incremental scope).
     # Compiled INSTEAD of the stock drc_test_provider_copper_clearance.cpp, which is left
     # pristine for comparison — swap these two lines to build the original DRC instead.

@@ -23,12 +23,11 @@ set( KICAD_SRCS
     dialogs/dialog_copyfiles_job_settings_base.cpp
     dialogs/dialog_executecommand_job_settings.cpp
     dialogs/dialog_executecommand_job_settings_base.cpp
-    dialogs/dialog_update_check_prompt_base.cpp
-    dialogs/dialog_update_check_prompt.cpp
     dialogs/dialog_update_notice_base.cpp
     dialogs/dialog_update_notice.cpp
     dialogs/dialog_template_selector_base.cpp
     dialogs/dialog_template_selector.cpp
+    dialogs/dialog_edit_cfg.cpp
     dialogs/panel_kicad_launcher_base.cpp
     dialogs/panel_kicad_launcher.cpp
     dialogs/panel_jobset_base.cpp
@@ -38,12 +37,15 @@ set( KICAD_SRCS
     import_proj.cpp
     import_project.cpp
     kicad_manager_frame.cpp
+    local_history_pane.cpp
     menubar.cpp
     project_template.cpp
     project_tree_pane.cpp
     project_tree.cpp
     project_tree_item.cpp
+    project_tree_traverser.cpp
     update_manager.cpp
+    toolbars_kicad_manager.cpp
     tools/kicad_manager_actions.cpp
     tools/kicad_manager_control.cpp
     )
@@ -60,14 +62,20 @@ set( KICAD_CLI_SRCS
     cli/command_pcb_export_gerber.cpp
     cli/command_pcb_export_gerbers.cpp
     cli/command_pcb_export_gencad.cpp
+    cli/command_pcb_export_hpgl.cpp
     cli/command_pcb_export_ipc2581.cpp
     cli/command_pcb_export_ipcd356.cpp
     cli/command_pcb_export_odb.cpp
     cli/command_pcb_export_pdf.cpp
     cli/command_pcb_export_pos.cpp
+    cli/command_pcb_export_ps.cpp
+    cli/command_pcb_export_stats.cpp
     cli/command_pcb_export_svg.cpp
+    cli/command_pcb_upgrade.cpp
+    cli/command_pcb_import.cpp
     cli/command_fp_export_svg.cpp
     cli/command_fp_upgrade.cpp
+    cli/command_sch_upgrade.cpp
     cli/command_sch_export_bom.cpp
     cli/command_sch_export_pythonbom.cpp
     cli/command_sch_export_netlist.cpp
@@ -148,6 +156,7 @@ if( APPLE )
     target_link_libraries( kicad
         nlohmann_json
         common
+        pads_common
         kicommon
         core
         ${wxWidgets_LIBRARIES}
@@ -160,6 +169,7 @@ if( APPLE )
     target_link_libraries( kicad-cli
         nlohmann_json
         common
+        pads_common
         ${wxWidgets_LIBRARIES}
         core
         )
@@ -169,6 +179,7 @@ else()
         common
         gal
         common      #repeated due to a circular dependency between gal and common
+        pads_common
         kicommon
         core
         ${wxWidgets_LIBRARIES}
@@ -179,6 +190,7 @@ else()
         common
         gal
         common      #repeated due to a circular dependency between gal and common
+        pads_common
         kicommon
         core
         ${wxWidgets_LIBRARIES}
@@ -223,9 +235,11 @@ if( APPLE )
     endif()
     set_target_properties( kicad PROPERTIES INSTALL_RPATH
             "@executable_path/../Frameworks;@executable_path/../Frameworks/Python.framework" )
+    if( PYTHON_FRAMEWORK )
+        set_target_properties( kicad-cli PROPERTIES BUILD_RPATH ${PYTHON_FRAMEWORK} )
+    endif()
     set_target_properties( kicad-cli PROPERTIES INSTALL_RPATH
             "@executable_path/../Frameworks;@executable_path/../Frameworks/Python.framework" )
-    set_target_properties( kicad-cli PROPERTIES BUILD_WITH_INSTALL_RPATH 1 )
 
     install( CODE "
         set( KICAD_CMAKE_MODULE_PATH \"${KICAD_CMAKE_MODULE_PATH}\" )

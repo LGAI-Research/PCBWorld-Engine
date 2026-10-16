@@ -74,7 +74,7 @@ while IFS= read -r f; do
   n_patch=$((n_patch + 1))
   patch_lines=$((patch_lines + $(wc -l < "$OUT/$rel.diff")))
   full_lines=$((full_lines + $(wc -l < "$f")))
-done < <(git ls-files "$PATCHED_ROOT/**")
+done < <(git ls-files "$PATCHED_ROOT/**" | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 
 # ---- round-trip gate: pristine + series must reproduce the full copies -----
 TMP="$(mktemp -d)"

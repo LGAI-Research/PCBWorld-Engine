@@ -22,6 +22,7 @@
 #include <optional>
 #include <memory>
 
+#include <board_item.h>
 #include "pns_arc.h"
 #include "pns_debug_decorator.h"
 #include "pns_line_placer.h"
@@ -439,7 +440,7 @@ bool LINE_PLACER::clipAndCheckCollisions( const VECTOR2I& aP, const SHAPE_LINE_C
 
     if( rv )
     {
-        aOut = l2;
+        aOut = std::move( l2 );
         thresholdDist = dist;
     }
 
@@ -839,8 +840,9 @@ bool LINE_PLACER::rhMarkObstacles( const VECTOR2I& aP, LINE& aNewHead, LINE& aNe
     // the shove/walk mode that certain users find too intrusive.
     if( obs )
     {
-        int              clearance = m_currentNode->GetClearance( obs->m_item, &m_head, false );
-        SHAPE_LINE_CHAIN hull = obs->m_item->Hull( clearance, m_head.Width(), m_head.Layer() );
+        int clearance = m_currentNode->GetClearance( obs->m_item, &m_head, false );
+        const SHAPE_LINE_CHAIN& hull = m_currentNode->GetRuleResolver()->HullCache(
+                obs->m_item, clearance, m_head.Width(), m_head.Layer() );
         VECTOR2I         nearest;
 
         DIRECTION_45::CORNER_MODE cornerMode = Settings().GetCornerMode();
@@ -927,13 +929,13 @@ bool LINE_PLACER::splitHeadTail( const LINE& aNewLine, const LINE& aOldTail, LIN
     else
     {
         newTail.Clear();
-        newHead = l2;
+        newHead = std::move( l2 );
     }
 
     PNS_DBG( Dbg(), AddItem, &newHead, BLUE, 500000, wxT( "head-post-split" ) );
 
-    aNewHead = newHead;
-    aNewTail = newTail;
+    aNewHead = std::move( newHead );
+    aNewTail = std::move( newTail );
 
     return true;
 }
@@ -1019,7 +1021,7 @@ bool LINE_PLACER::rhShoveOnly( const VECTOR2I& aP, LINE& aNewHead, LINE& aNewTai
             aNewHead.AppendVia( newHead.Via() );
 
         OPTIMIZER::Optimize( &aNewHead, effort, m_currentNode );
-        PNS_DBG( Dbg(), AddItem, aNewHead.Clone(), GREEN, 1000000, "head-sh-postopt" );
+        PNS_DBG( Dbg(), AddItem, &aNewHead, GREEN, 1000000, "head-sh-postopt" );
 
         return true;
     }
@@ -1158,8 +1160,8 @@ void LINE_PLACER::routeStep( const VECTOR2I& aP )
 
         if( !routeHead( aP, newHead, newTail ) )
         {
-            m_tail = prevTail;
-            m_head = prevHead;
+            m_tail = std::move( prevTail );
+            m_head = std::move( prevHead );
 
             // If we fail to walk out of the initial point (no tail), instead of returning an empty
             // line, return a zero-length line so that the user gets some feedback that routing is
@@ -1182,8 +1184,8 @@ void LINE_PLACER::routeStep( const VECTOR2I& aP )
 
         PNS_DBG( Dbg(), Message, wxString::Format( "N VIA H %d T %d\n", m_head.EndsWithVia() ? 1 : 0, m_tail.EndsWithVia() ? 1 : 0 ) );
 
-        m_head = newHead;
-        m_tail = newTail;
+        m_head = std::move( newHead );
+        m_tail = std::move( newTail );
 
         if( handleSelfIntersections() )
         {
@@ -1511,6 +1513,15 @@ bool LINE_PLACER::Move( const VECTOR2I& aP, ITEM* aEndItem )
     m_endItem = aEndItem;
 
     bool reachesEnd = route( aP );
+
+    // Preserve a via requested at the routing start when no cursor movement can
+    // create the normal via stub.
+    if( m_placingVia && aP == m_p_start && !m_head.EndsWithVia() )
+    {
+        VIA fallbackVia = makeVia( aP );
+        fallbackVia.SetNet( m_currentNet );
+        m_head.AppendVia( fallbackVia );
+    }
 
     current = Trace();
 
@@ -2175,7 +2186,7 @@ void FIXED_TAIL::AddStage( const VECTOR2I& aStart, int aLayer, bool placingVias,
     st.pts.push_back(pt);
     st.commit = aNode;
 
-    m_stages.push_back( st );
+    m_stages.push_back( std::move( st ) );
 }
 
 

@@ -7,7 +7,6 @@
  */
 
 #include <board_stackup_manager/stackup_predefined_prms.h>
-#include <fp_lib_table.h>
 #include <kiface_base.h>
 #include <vector>
 
@@ -20,8 +19,6 @@ const std::vector<FAB_LAYER_COLOR>& GetStandardColors( BOARD_STACKUP_ITEM_TYPE a
     return dummy_colors;
 }
 
-// Stub for GFootprintTable - global footprint library table (not needed for headless routing)
-FP_LIB_TABLE GFootprintTable;
 
 // Stub for Kiface - KiCad plugin interface (not needed for headless RL router)
 class KIFACE_STUB : public KIFACE_BASE

@@ -32,10 +32,8 @@
  *  registration, so it is a transparent substitute. Two RL differences from the
  *  stock provider:
  *
- *   1. Event-driven wait in testTrackClearances(): the main thread waits with
- *      wait_for_tasks_duration(250ms), returning as soon as the parallel work
- *      finishes — 250 ms is only the progress-report cadence (the pattern every
- *      other loop in this file uses).
+ *   1. Event-driven waits in testTrackClearances(): 250 ms is only the
+ *      progress-report cadence; completion wakes the main thread immediately.
  *
  *   2. Incremental clearance scope (drc/drc_rl_scope.h): when DRC_RL::GetClearanceScope()
  *      is non-null, the outer track loop is restricted to those items (each still tested
@@ -46,7 +44,6 @@
  */
 
 #include <common.h>
-#include <math_for_graphics.h>
 #include <board_design_settings.h>
 #include <footprint.h>
 #include <layer_range.h>
@@ -65,7 +62,8 @@
 #include <drc/drc_rtree.h>
 #include <drc/drc_item.h>
 #include <drc/drc_rule.h>
-#include <drc/drc_test_provider_clearance_base.h>
+#include <drc/drc_test_provider.h>
+#include <pcb_marker.h>
 #include <drc/drc_creepage_utils.h>
 #include <pcb_dimension.h>
 
@@ -90,11 +88,11 @@
 // error from the scope symbols PNS_RL_ROUTER::runDRCEngine() always references.
 
 
-class DRC_TEST_PROVIDER_COPPER_CLEARANCE : public DRC_TEST_PROVIDER_CLEARANCE_BASE
+class DRC_TEST_PROVIDER_COPPER_CLEARANCE : public DRC_TEST_PROVIDER
 {
 public:
     DRC_TEST_PROVIDER_COPPER_CLEARANCE () :
-            DRC_TEST_PROVIDER_CLEARANCE_BASE(),
+            DRC_TEST_PROVIDER(),
             m_drcEpsilon( 0 )
     {
     }
@@ -109,11 +107,6 @@ public:
     {
         return wxT( "clearance" );
     };
-
-    virtual const wxString GetDescription() const override
-    {
-        return wxT( "Tests copper item clearance" );
-    }
 
 private:
     /**
@@ -140,6 +133,10 @@ private:
     void testItemAgainstZone( BOARD_ITEM* aItem, ZONE* aZone, PCB_LAYER_ID aLayer );
 
     void testKnockoutTextAgainstZone( BOARD_ITEM* aText, NETINFO_ITEM** aInheritedNet, ZONE* aZone );
+    void ReportAndShowPathCuToCu( std::shared_ptr<DRC_ITEM>& aDrce, const VECTOR2I& aMarkerPos,
+                                  int aMarkerLayer, const BOARD_ITEM* aItem1, const BOARD_ITEM* aItem2,
+                                  PCB_LAYER_ID layer, int aDistance );
+
 
     typedef struct checked
     {
@@ -164,7 +161,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::Run()
 
     if( m_board->m_DRCMaxClearance <= 0 )
     {
-        reportAux( wxT( "No Clearance constraints found. Tests not run." ) );
+        REPORT_AUX( wxT( "No Clearance constraints found. Tests not run." ) );
         return true;   // continue with other tests
     }
 
@@ -231,9 +228,58 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::Run()
         testZonesToZones();
     }
 
-    reportRuleStatistics();
 
     return !m_drcEngine->IsCancelled();
+}
+
+
+void DRC_TEST_PROVIDER_COPPER_CLEARANCE::ReportAndShowPathCuToCu(
+        std::shared_ptr<DRC_ITEM>& aDrce, const VECTOR2I& aMarkerPos, int aMarkerLayer,
+        const BOARD_ITEM* aItem1, const BOARD_ITEM* aItem2, PCB_LAYER_ID layer, int aDistance )
+{
+    CREEPAGE_GRAPH graph( *m_board );
+    std::shared_ptr<GRAPH_NODE> netA = graph.AddNodeVirtual();
+    std::shared_ptr<GRAPH_NODE> netB = graph.AddNodeVirtual();
+
+    // The path search requires distinct nets.
+    netA->m_net = 1;
+    netB->m_net = 2;
+
+    graph.Addshape( *( aItem1->GetEffectiveShape( layer ) ), netA, nullptr );
+    graph.Addshape( *( aItem2->GetEffectiveShape( layer ) ), netB, nullptr );
+    graph.GeneratePaths( aDistance * 2, layer );
+
+    double            minValue = aDistance * 2;
+    GRAPH_CONNECTION* minConnection = nullptr;
+
+    for( const std::shared_ptr<GRAPH_CONNECTION>& connection : graph.m_connections )
+    {
+        if( connection->m_path.weight < minValue && connection->m_path.weight > 0 )
+        {
+            minValue = connection->m_path.weight;
+            minConnection = connection.get();
+        }
+    }
+
+    if( minConnection )
+    {
+        PATH_CONNECTION pathConnection = minConnection->m_path;
+        std::vector<PCB_SHAPE> path;
+        minConnection->GetShapes( path );
+        VECTOR2I startPoint = pathConnection.a1;
+        VECTOR2I endPoint = pathConnection.a2;
+
+        // KiCad 10 has one path channel; the marker renders it with its standard style.
+        reportViolation( aDrce, aMarkerPos, aMarkerLayer,
+                         [&]( PCB_MARKER* aMarker )
+                         {
+                             aMarker->SetPath( path, startPoint, endPoint );
+                         } );
+    }
+    else
+    {
+        reportViolation( aDrce, aMarkerPos, aMarkerLayer );
+    }
 }
 
 
@@ -343,7 +389,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testSingleLayerItemAgainstItem( BOARD_I
                             itemNet ? itemNet->GetNetname() : _( "<no net>" ),
                             otherNet ? otherNet->GetNetname() : _( "<no net>" ) );
 
-                drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                 drcItem->SetItems( item, other );
 
                 reportViolation( drcItem, pos, layer );
@@ -360,7 +406,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testSingleLayerItemAgainstItem( BOARD_I
                                           clearance,
                                           actual );
 
-                drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                 drcItem->SetItems( item, other );
                 drcItem->SetViolatingRule( constraint.GetParentRule() );
 
@@ -421,7 +467,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testSingleLayerItemAgainstItem( BOARD_I
                                               clearance,
                                               actual );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( a[ii], b[ii] );
                     drcItem->SetViolatingRule( constraint.GetParentRule() );
 
@@ -538,7 +584,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testItemAgainstZone( BOARD_ITEM* aItem,
                                       clearance,
                                       actual );
 
-            drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+            drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
             drcItem->SetItems( aItem, aZone );
             drcItem->SetViolatingRule( constraint.GetParentRule() );
             ReportAndShowPathCuToCu( drcItem, pos, aLayer, aItem, aZone, aLayer, actual );
@@ -576,7 +622,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testItemAgainstZone( BOARD_ITEM* aItem,
                                               clearance,
                                               actual );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( aItem, aZone );
                     drcItem->SetViolatingRule( constraint.GetParentRule() );
                     ReportAndShowPathCuToCu( drcItem, pos, aLayer, aItem, aZone, aLayer, actual );
@@ -660,7 +706,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testKnockoutTextAgainstZone( BOARD_ITEM
                                  actual );
             }
 
-            drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+            drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
             drcItem->SetItems( aText, aZone );
             drcItem->SetViolatingRule( constraint.GetParentRule() );
             ReportAndShowPathCuToCu( drcItem, pos, layer, aText, aZone, layer, actual );
@@ -695,7 +741,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testTrackClearances()
 
     size_t                                                count = scopeTracks.size();
 
-    reportAux( wxT( "Testing %d tracks & vias..." ), count );
+    REPORT_AUX( wxString::Format( wxT( "Testing %d tracks & vias..." ), count ) );
 
     LSET boardCopperLayers = LSET::AllCuMask( m_board->GetCopperLayerCount() );
 
@@ -807,22 +853,22 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testTrackClearances()
 
     thread_pool& tp = GetKiCadThreadPool();
 
-    tp.push_loop( scopeTracks.size(), testTrack );
+    auto tasks = tp.submit_blocks( 0, static_cast<int>( scopeTracks.size() ), testTrack );
 
-    // Event-driven wait: wait_for_tasks_duration() returns as soon as the loop
-    // finishes; the 250 ms is only the progress-report cadence. Every other
-    // provider loop in this file also waits event-driven (see testZonesToZones).
+    // Event-driven wait: the block futures wake immediately when all track work finishes;
+    // 250 ms is only the progress-report cadence.
     while( true )
     {
         reportProgress( done, count );
 
         if( m_drcEngine->IsCancelled() )
         {
-            tp.wait_for_tasks();
+            tasks.wait();
             break;
         }
 
-        if( tp.wait_for_tasks_duration( std::chrono::milliseconds( 250 ) ) )
+        if( tasks.wait_until( std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds( 250 ) ) )
             break;
     }
 }
@@ -941,7 +987,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadAgainstItem( PAD* pad, SHAPE* pa
                         pad->GetNetname(),
                         otherPad->GetNetname() );
 
-            drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+            drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
             drcItem->SetItems( pad, otherPad );
 
             reportViolation( drcItem, otherPad->GetPosition(), aLayer );
@@ -972,7 +1018,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadAgainstItem( PAD* pad, SHAPE* pa
                                                      pad->GetNetname(),
                                                      otherCItem->GetNetname() );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( pad, other );
 
                     reportViolation( drcItem, pos, aLayer );
@@ -987,7 +1033,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadAgainstItem( PAD* pad, SHAPE* pa
                                               clearance,
                                               actual );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( pad, other );
                     drcItem->SetViolatingRule( constraint.GetParentRule() );
                     ReportAndShowPathCuToCu( drcItem, pos, aLayer, pad, other, aLayer, actual );
@@ -1009,7 +1055,7 @@ bool DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadAgainstItem( PAD* pad, SHAPE* pa
                                               clearance,
                                               actual );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( item, otherItem );
                     drcItem->SetViolatingRule( constraint.GetParentRule() );
                     ReportAndShowPathCuToCu( drcItem, pos, aLayer, item, otherItem, aLayer, actual );
@@ -1067,14 +1113,14 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadClearances( )
     for( FOOTPRINT* footprint : m_board->Footprints() )
         count += footprint->Pads().size();
 
-    reportAux( wxT( "Testing %d pads..." ), count );
+    REPORT_AUX( wxString::Format( wxT( "Testing %d pads..." ), count ) );
 
     std::unordered_map<PTR_PTR_CACHE_KEY, layers_checked> checkedPairs;
     std::mutex                                            checkedPairsMutex;
 
     LSET boardCopperLayers = LSET::AllCuMask( m_board->GetCopperLayerCount() );
 
-    std::future<void> retn = tp.submit(
+    std::future<void> retn = tp.submit_task(
             [&]()
             {
                 for( FOOTPRINT* footprint : m_board->Footprints() )
@@ -1147,12 +1193,14 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testPadClearances( )
                 }
             } );
 
-    std::future_status status = retn.wait_for( std::chrono::milliseconds( 250 ) );
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 250 );
+    std::future_status status = retn.wait_until( deadline );
 
     while( status != std::future_status::ready )
     {
         reportProgress( done, count );
-        status = retn.wait_for( std::chrono::milliseconds( 250 ) );
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 250 );
+        status = retn.wait_until( deadline );
     }
 }
 
@@ -1171,7 +1219,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testGraphicClearances()
     for( FOOTPRINT* footprint : m_board->Footprints() )
         count += footprint->GraphicalItems().size();
 
-    reportAux( wxT( "Testing %d graphics..." ), count );
+    REPORT_AUX( wxString::Format( wxT( "Testing %d graphics..." ), count ) );
 
     auto isKnockoutText =
             []( BOARD_ITEM* item )
@@ -1270,7 +1318,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testGraphicClearances()
                         m_board->m_DRCMaxClearance );
             };
 
-    std::future<void> retn = tp.submit(
+    std::future<void> retn = tp.submit_task(
             [&]()
             {
                 for( BOARD_ITEM* item : m_board->Drawings() )
@@ -1303,12 +1351,14 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testGraphicClearances()
                 }
         } );
 
-    std::future_status status = retn.wait_for( std::chrono::milliseconds( 250 ) );
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 250 );
+    std::future_status status = retn.wait_until( deadline );
 
     while( status != std::future_status::ready )
     {
         reportProgress( done, count );
-        status = retn.wait_for( std::chrono::milliseconds( 250 ) );
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 250 );
+        status = retn.wait_until( deadline );
     }
 }
 
@@ -1327,6 +1377,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
     poly_segments.resize( m_board->m_DRCCopperZones.size() );
 
     thread_pool&        tp = GetKiCadThreadPool();
+    BS::multi_future<void> tasks;
     std::atomic<size_t> done( 0 );
     size_t              count = 0;
 
@@ -1340,7 +1391,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
                 {
                     drcItem = DRC_ITEM::Create( DRCE_ZONES_INTERSECT );
                     wxString msg = _( "(intersecting zones must have distinct priorities)" );
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( zoneA, zoneB );
                     reportViolation( drcItem, pt, layer );
                 }
@@ -1352,7 +1403,7 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
                                               constraint.GetValue().Min(),
                                               std::max( actual, 0 ) );
 
-                    drcItem->SetErrorMessage( drcItem->GetErrorText() + wxS( " " ) + msg );
+                    drcItem->SetErrorMessage( drcItem->GetErrorText( true ) + wxS( " " ) + msg );
                     drcItem->SetItems( zoneA, zoneB );
                     drcItem->SetViolatingRule( constraint.GetParentRule() );
                     ReportAndShowPathCuToCu( drcItem, pt, layer, zoneA, zoneB, layer, actual );
@@ -1363,6 +1414,9 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
             [this, testClearance, testIntersects, reportZoneZoneViolation, &poly_segments, &done]
             ( int zoneA_idx, int zoneB_idx, bool sameNet, PCB_LAYER_ID layer ) -> void
             {
+                if( m_drcEngine->IsCancelled() )
+                    return;
+
                 ZONE*    zoneA = m_board->m_DRCCopperZones[zoneA_idx];
                 ZONE*    zoneB = m_board->m_DRCCopperZones[zoneB_idx];
                 int      actual = 0;
@@ -1511,7 +1565,11 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
                     continue;
 
                 count++;
-                tp.push_task( checkZones, ia, ia2, sameNet, layer );
+                tasks.push_back( tp.submit_task(
+                        [&checkZones, ia, ia2, sameNet, layer]()
+                        {
+                            checkZones( ia, ia2, sameNet, layer );
+                        } ) );
             }
         }
     }
@@ -1521,9 +1579,13 @@ void DRC_TEST_PROVIDER_COPPER_CLEARANCE::testZonesToZones()
         reportProgress( done, count );
 
         if( m_drcEngine->IsCancelled() )
+        {
+            tasks.wait();
             break;
+        }
 
-        if( tp.wait_for_tasks_duration( std::chrono::milliseconds( 250 ) ) )
+        if( tasks.wait_until( std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds( 250 ) ) )
             break;
     }
 

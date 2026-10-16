@@ -41,6 +41,7 @@ using namespace std::placeholders;
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <list>
 
 #include <delaunator.hpp>
 
@@ -206,17 +207,6 @@ public:
         if( anchors.empty() )
         {
             return;
-        }
-        else if( anchors.size() == 1 )
-        {
-            // All anchors share one position — nothing to triangulate. Fall
-            // through to the per-position anchor-chain pass below, which emits
-            // one weight-1 edge per pair of DISTINCT clusters (cluster
-            // identity). A Parent()->GetLayerSet() overlap test over
-            // consecutive nodes would not do: parents report layer sets wider
-            // than their actual copper (through vias/pads, multi-layer zones),
-            // so a cross-cluster pair could be silently treated as connected
-            // and the required edge dropped (undercount).
         }
         else if( areNodesColinear( anchors ) )
         {
@@ -671,4 +661,3 @@ bool RN_NET::NearestBicoloredPair( RN_NET* aOtherNet, VECTOR2I& aPos1, VECTOR2I&
 
     return rv;
 }
-

@@ -11,7 +11,30 @@
  
  #include <ngspice/sharedspice.h>
  
-@@ -267,7 +269,9 @@
+@@ -68,13 +70,13 @@
+     s_glVersion = wxString::FromUTF8( aVersion );
+ }
+ 
+-
+ void SetOpenGLBackendInfo( wxString aBackend )
+ {
+     s_glBackend = aBackend;
+ }
+ 
+ 
++
+ wxString GetPlatformGetBitnessName()
+ {
+     // wxPlatformInfo is not thread-safe, so protect it
+@@ -267,7 +269,6 @@
+ 
+     if( !glMsg.empty() )
+         aMsg << eol << "OpenGL: " << glMsg;
+-
+     aMsg << eol << eol;
+ 
+     if( !aBrief )
+@@ -305,7 +306,9 @@
           << ( BOOST_VERSION / 100 % 1000 ) << wxT( "." )
           << ( BOOST_VERSION % 100 ) << eol;
  

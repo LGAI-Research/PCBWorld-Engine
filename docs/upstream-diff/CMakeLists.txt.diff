@@ -33,11 +33,12 @@
  option( KICAD_STDLIB_LIGHT_DEBUG
      "Build KiCad with libstdc++ with -Wp,-D_GLIBCXX_ASSERTIONS flag enabled. Not as intrusive as KICAD_STDLIB_DEBUG"
      OFF )
-@@ -251,10 +251,10 @@
+@@ -250,11 +250,11 @@
+     "Enable Whole Program Optimization"
      OFF "WIN32"
      OFF )
- 
 +
+ 
  option( KICAD_USE_PCH
      "Enable precompiled header support"
      ON )
@@ -54,15 +55,15 @@
      set(KICMAKE_CFG_INTDIR ".")
  endif()
  
-@@ -331,6 +331,8 @@
+@@ -330,6 +330,8 @@
+ add_compile_definitions( $<$<BOOL:${KICAD_GAL_PROFILE}>:KICAD_GAL_PROFILE> )
  add_compile_definitions( $<$<BOOL:${KICAD_WIN32_VERIFY_CODESIGN}>:KICAD_WIN32_VERIFY_CODESIGN> )
  add_compile_definitions( $<$<BOOL:${KICAD_UPDATE_CHECK}>:KICAD_UPDATE_CHECK> )
++
++
  
-+
-+
  if( KICAD_IPC_API )
      add_definitions( -DKICAD_IPC_API )
- endif()
 @@ -881,22 +883,21 @@
  include( MinGWResourceCompiler )
  
@@ -97,7 +98,20 @@
  
  # Try to find Protobuf with modern approach first, fallback to legacy if needed
  set( _protobuf_found FALSE )
-@@ -1133,6 +1134,7 @@
+@@ -1095,6 +1096,12 @@
+ 
+ find_package( wxWidgets ${wxWidgets_REQ_VERSION} COMPONENTS gl aui adv html core net base propgrid xml stc richtext webview REQUIRED )
+ 
++if( UNIX AND NOT APPLE AND KICAD_WX_WEBVIEW_LIBRARY )
++    # Conda's Linux wx-config advertises this component without shipping its library.
++    list( REMOVE_ITEM wxWidgets_LIBRARIES "-lwx_gtk3u_webview-3.2" )
++    list( APPEND wxWidgets_LIBRARIES "${KICAD_WX_WEBVIEW_LIBRARY}" )
++endif()
++
+ # Include wxWidgets macros.
+ include( ${wxWidgets_USE_FILE} )
+ 
+@@ -1133,6 +1140,7 @@
      endif()
  endif()
  
@@ -105,7 +119,7 @@
  message(STATUS "wxUSE_GLCANVAS_EGL=${wxWidgets_GLCANVAS_EGL}")
  message(STATUS "wxHAS_GLX=${wxWidgets_HAS_GLX}")
  message(STATUS "wxHAS_EGL=${wxWidgets_HAS_EGL}")
-@@ -1144,7 +1146,6 @@
+@@ -1144,7 +1152,6 @@
      message( STATUS "Configuring KiCad to support Wayland features" )
      add_compile_definitions( KICAD_WAYLAND )
  endif()

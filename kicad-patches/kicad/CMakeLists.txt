@@ -1096,6 +1096,12 @@ set( wxWidgets_CONFIG_OPTIONS ${wxWidgets_CONFIG_OPTIONS} --static=no )
 
 find_package( wxWidgets ${wxWidgets_REQ_VERSION} COMPONENTS gl aui adv html core net base propgrid xml stc richtext webview REQUIRED )
 
+if( UNIX AND NOT APPLE AND KICAD_WX_WEBVIEW_LIBRARY )
+    # Conda's Linux wx-config advertises this component without shipping its library.
+    list( REMOVE_ITEM wxWidgets_LIBRARIES "-lwx_gtk3u_webview-3.2" )
+    list( APPEND wxWidgets_LIBRARIES "${KICAD_WX_WEBVIEW_LIBRARY}" )
+endif()
+
 # Include wxWidgets macros.
 include( ${wxWidgets_USE_FILE} )
 

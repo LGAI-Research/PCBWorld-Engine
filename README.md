@@ -73,7 +73,7 @@ DYLD_LIBRARY_PATH=build_rl/kicad/KiCad.app/Contents/Frameworks \
   STEP exporter. The script hands the Homebrew or the active conda env's OCC to CMake
   whenever one is present — for engine-only builds too, so the configuration does not flip
   between the two invocations of one build tree. The RL module itself never touches OCC.
-- Linux KiCad 10.0.7 builds require `libspnav-dev`, `libwxgtk-webview3.2-dev`, `libpoppler-dev`, `libpoppler-cpp-dev` and `libpoppler-glib-dev`. The wx package supplies headers and the WebView library missing from conda wx.
+- Linux KiCad 10.0.7 builds require `libspnav-dev`, `libx11-dev`, `libwxgtk-webview3.2-dev`, `libpoppler-dev`, `libpoppler-cpp-dev` and `libpoppler-glib-dev`. The wx package supplies headers and the WebView library missing from conda wx.
 - Cost (64-core host): the three targets together are 1 352 ninja steps from scratch, about
   4.5 minutes. A tree configured before OCC was available recompiles everything once when
   OCC first lands (the compile flags change). Re-running the script with unchanged sources

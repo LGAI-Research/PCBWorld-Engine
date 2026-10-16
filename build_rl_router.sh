@@ -239,6 +239,9 @@ cp -p "$PATCHES_DIR/kicad/pcbnew/ratsnest/ratsnest_data.cpp"    "$KICAD_SRC/pcbn
 #     DRC baseline) need every violation, and the cap also misfiles shorts as
 #     clearance violations once the shorting budget is spent.
 cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_engine.cpp"           "$KICAD_SRC/pcbnew/drc/drc_engine.cpp"
+# Keep creepage path search inline when it is called by this same pool's worker, avoiding
+# nested-future starvation without dropping DRC marker paths or violations.
+cp -p "$PATCHES_DIR/kicad/pcbnew/drc/drc_creepage_utils.cpp" "$KICAD_SRC/pcbnew/drc/drc_creepage_utils.cpp"
 # Two related layer fixes:
 #   pns_joint.h: JOINT::operator== now includes the layer range (removes a
 #     latent stacked-joint confusion trap).
@@ -253,10 +256,10 @@ cp -p "$PATCHES_DIR/rl/pns_rl_router.cpp"    "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_router.h"      "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_iface.cpp"     "$KICAD_SRC/pcbnew/router/"
 cp -p "$PATCHES_DIR/rl/pns_rl_iface.h"       "$KICAD_SRC/pcbnew/router/"
-# RL DRC (tag: _rl_): the stock DRC files are left PRISTINE. Our copper-clearance fork
-# (event-driven wait + incremental clearance scope) is dropped in alongside them and
-# compiled INSTEAD of the original by kicad-patches/rl/CMakeLists.txt's DRC_SRCS. The
-# scope plumbing lives in a thread_local (drc_rl_scope.h), so no core DRC file is touched.
+# RL DRC (tag: _rl_): the stock DRC provider files stay pristine. Our copper-clearance fork
+# (event-driven wait + incremental scope) is dropped in alongside them and compiled INSTEAD
+# of the stock provider by kicad-patches/rl/CMakeLists.txt. The shared creepage graph helper
+# is overlaid above only to avoid nested work submitted back to its caller's thread pool.
 cp -p "$PATCHES_DIR/rl/drc_test_provider_rl_copper_clearance.cpp" "$KICAD_SRC/pcbnew/drc/"
 cp -p "$PATCHES_DIR/rl/drc_rl_scope.cpp"     "$KICAD_SRC/pcbnew/drc/"
 cp -p "$PATCHES_DIR/rl/drc_rl_scope.h"       "$KICAD_SRC/pcbnew/drc/"
@@ -270,7 +273,7 @@ cp -p "$PATCHES_DIR/rl/CMakeLists.txt"       "$KICAD_SRC/pcbnew/python/rl/"
 cp -p "$PATCHES_DIR/rl/tracks_cleaner_rl.cpp" "$KICAD_SRC/pcbnew/"
 cp -p "$PATCHES_DIR/rl/tracks_cleaner_rl.h"   "$KICAD_SRC/pcbnew/"
 
-echo "  Done (28 KiCad source overlays, 12 RL source files)"
+echo "  Done (29 KiCad source overlays, 12 RL source files)"
 
 # ──────────────────────────────────────────────
 # Step 3: CMake Configure

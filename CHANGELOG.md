@@ -11,6 +11,7 @@ PCBWorld environment, which pins one engine commit per environment release.
 - On macOS, resolve Python symbols from the embedding interpreter and report the actual app-bundle `kicad-cli` path.
 - Linux builds use system wx WebView headers/library because the conda wx package advertises WebView but omits the library; Poppler, SPNAV and X11 development headers are also required.
 - Include `api_schema_build_copy` in CLI builds; without it, headless commands log a missing `schemas/api.v1.schema.json`.
+- Print platform-specific runtime/test hints; Linux no longer suggests `DYLD_LIBRARY_PATH`, and the API suite command disables the uninstalled xdist default.
 - Bump `kicad-patches/ENGINE_VERSION` from 1.4 to 1.5.
 
 ## v1.0.1 — 2026-09-16

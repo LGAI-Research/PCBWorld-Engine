@@ -417,7 +417,9 @@ echo "engine C++ content: $CPP_HASH (stamped next to module)"
 
 echo ""
 echo "Usage:"
-echo "  export DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}'"
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "  export DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}'"
+fi
 PYTHONPATH_HINT="${BUILD_DIR}/pcbnew/python/rl"
 if [ "$BUILD_PCBNEW" = "1" ] && [ -n "${PCBNEW_SITE:-}" ]; then
     PYTHONPATH_HINT="${PYTHONPATH_HINT}:${PCBNEW_SITE}"
@@ -433,5 +435,13 @@ if [ "$BUILD_CLI" = "1" ]; then
     echo "  KICAD_RUN_FROM_BUILD_DIR=1 '${CLI_BUILT}' --version"
 fi
 echo ""
-echo "Test:"
-echo "  DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}' pytest tests/ -v"
+echo "Test (from PCBWorld root):"
+if [ -d "${HOST_ROOT}/tests/test_engine_api" ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "  (cd '${HOST_ROOT}' && DYLD_LIBRARY_PATH='${FRAMEWORKS_DIR}' python3 -m pytest -o addopts= -v tests/test_engine_api)"
+    else
+        echo "  (cd '${HOST_ROOT}' && python3 -m pytest -o addopts= -v tests/test_engine_api)"
+    fi
+else
+    echo "  Run tests/test_engine_api from a PCBWorld environment checkout."
+fi

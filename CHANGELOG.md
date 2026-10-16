@@ -9,6 +9,7 @@ PCBWorld environment, which pins one engine commit per environment release.
 - Remove property-grid, DRC R-tree, and CLI-render overlays whose changes are now upstream; retain the Engine DRC report-cap change and bounded `Finish(int)` adaptation.
 - Preserve RL API behavior and wire protocol version 2, including the handshake, field order, and constants.
 - On macOS, resolve Python symbols from the embedding interpreter and report the actual app-bundle `kicad-cli` path.
+- Linux builds use system wx WebView headers/library because the conda wx package advertises WebView but omits the library; Poppler and SPNAV development headers are also required.
 - Bump `kicad-patches/ENGINE_VERSION` from 1.4 to 1.5.
 
 ## v1.0.1 — 2026-09-16

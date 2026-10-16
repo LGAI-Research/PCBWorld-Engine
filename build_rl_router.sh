@@ -347,8 +347,9 @@ echo ""
 # kicad_rl_router is the only target the core RL/DRC pipeline needs.
 # kicad-cli is optional: only envs/rendering (SVG/PDF/3D) shells out to it.
 # Gate with BUILD_CLI=1.
+# Its plugin manager needs the API schema staged in the build tree for headless commands.
 NINJA_TARGETS="kicad_rl_router"
-[ "$BUILD_CLI"       = "1" ] && NINJA_TARGETS="$NINJA_TARGETS kicad-cli"
+[ "$BUILD_CLI"       = "1" ] && NINJA_TARGETS="$NINJA_TARGETS kicad-cli api_schema_build_copy"
 [ "$BUILD_PCBNEW"    = "1" ] && NINJA_TARGETS="$NINJA_TARGETS pcbnew_kiface pcbnew_python_module"
 echo "=== Build targets: $NINJA_TARGETS ==="
 ninja $NINJA_TARGETS

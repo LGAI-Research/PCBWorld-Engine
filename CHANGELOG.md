@@ -8,6 +8,8 @@ PCBWorld environment, which pins one engine commit per environment release.
 - Pin the KiCad source at tag `10.0.7`, commit `69cafb907ebc09e7722a2a464b1d466fc2e3608d`; `build_rl_router.sh` enforces the commit because the nested gitlink is owned by the upstream `kicad-python` submodule.
 - Remove property-grid, DRC R-tree, and CLI-render overlays whose changes are now upstream; retain the Engine DRC report-cap change and bounded `Finish(int)` adaptation.
 - Preserve RL API behavior and wire protocol version 2, including the handshake, field order, and constants.
+- Prevent copper-clearance path-generation deadlocks by running both creepage work phases inline
+  on same-pool workers and avoiding thread-reserve underflow at pool sizes of four or fewer.
 - On macOS, resolve Python symbols from the embedding interpreter and report the actual app-bundle `kicad-cli` path.
 - Linux builds use system wx WebView headers/library because the conda wx package advertises WebView but omits the library; Poppler, SPNAV and X11 development headers are also required.
 - Include `api_schema_build_copy` in CLI builds; without it, headless commands log a missing `schemas/api.v1.schema.json`.

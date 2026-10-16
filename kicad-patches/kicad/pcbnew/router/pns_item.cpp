@@ -32,18 +32,6 @@ typedef VECTOR2I::extended_type ecoord;
 
 namespace PNS {
 
-static void dumpObstacles( const PNS::NODE::OBSTACLES &obstacles )
-{
-    printf( "&&&& %zu obstacles: \n", obstacles.size() );
-
-    for( const auto& obs : obstacles )
-    {
-        printf( "%p [%s] - %p [%s], clearance %d\n",
-                obs.m_head, obs.m_head->KindStr().c_str(),
-                obs.m_item, obs.m_item->KindStr().c_str(),
-                obs.m_clearance );
-    }
-}
 
 
 // prune self-collisions, i.e. a via/pad annular ring with its own hole
@@ -149,6 +137,10 @@ bool ITEM::collideSimple( const ITEM* aHead, const NODE* aNode, int aLayer,
     if ( !shouldWeConsiderHoleCollisions( this, aHead ) )
         return false;
 
+    // Physical rules are net-blind, so a user-defined physical_hole_clearance rule
+    // must allow hole recursion for same-net pairs.
+    const bool runPhysicalOnly = aNode->GetRuleResolver()->HasUserDefinedPhysicalConstraint();
+
     // Special cases for "head" lines with vias attached at the end.  Note that this does not
     // support head-line-via to head-line-via collisions, but you can't route two independent
     // tracks at once so it shouldn't come up.
@@ -168,8 +160,9 @@ bool ITEM::collideSimple( const ITEM* aHead, const NODE* aNode, int aLayer,
     // And a special case for the "head" via's hole.
     if( aHead->HasHole() && shouldWeConsiderHoleCollisions( this, holeH ) )
     {
-        // Skip net check when doing hole-to-hole collisions.
-        if( Kind() == HOLE_T || Net() != holeH->Net() )
+        // Skip net check when doing hole-to-hole collisions, or when a user physical
+        // rule may apply across nets.
+        if( Kind() == HOLE_T || Net() != holeH->Net() || runPhysicalOnly )
             collisionsFound |= collideSimple( holeH, aNode, aLayer, aCtx );
     }
 
@@ -204,12 +197,13 @@ bool ITEM::collideSimple( const ITEM* aHead, const NODE* aNode, int aLayer,
     if( Kind() == HOLE_T && aHead->Kind() == HOLE_T )
         differentNetsOnly = false;
 
-    if( differentNetsOnly && Net() == aHead->Net() && aHead->Net() )
+    // Same-net and free-pad items normally skip clearance, but physical rules are net-blind.
+    if( differentNetsOnly && Net() == aHead->Net() && aHead->Net() && !runPhysicalOnly )
     {
         // same nets? no clearance!
         clearance = -1;
     }
-    else if( differentNetsOnly && ( IsFreePad() || aHead->IsFreePad() ) )
+    else if( differentNetsOnly && ( IsFreePad() || aHead->IsFreePad() ) && !runPhysicalOnly )
     {
         // a pad associated with a "free" pin (NIC) doesn't have a net until it has been used
         clearance = -1;
@@ -252,6 +246,9 @@ bool ITEM::collideSimple( const ITEM* aHead, const NODE* aNode, int aLayer,
 
         const SHAPE* shapeI = Shape( aLayer );
         const SHAPE* shapeH = aHead->Shape( aLayer );
+
+        if( !shapeI || !shapeH )
+            return false;
 
         if( checkCastellation || checkNetTie )
         {

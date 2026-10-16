@@ -17,7 +17,15 @@
      delete m_logger;
  }
  
-@@ -540,7 +547,7 @@
+@@ -353,7 +360,6 @@
+             SetFailureReason( errorMsg );
+             return false;
+         }
+-
+         // We intentionally do not reject a start point whose existing gap differs from the
+         // configured diff pair gap. Starting inside a neckdown area (e.g. a narrowed gap under a
+         // BGA) and widening out to the netclass gap is a legitimate workflow. The placer fits the
+@@ -546,7 +552,7 @@
  }
  
  
@@ -26,8 +34,8 @@
  {
      if( m_state != ROUTE_TRACK )
          return false;
-@@ -564,8 +571,9 @@
-     if( !getNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
+@@ -570,8 +576,9 @@
+     if( !GetNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
          return false;
  
 -    // Keep moving until we don't change position or hit the limit

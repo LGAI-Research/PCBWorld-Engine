@@ -27,6 +27,7 @@
 
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/name_generator_sha1.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
 #if BOOST_VERSION >= 106700
@@ -37,22 +38,18 @@
 
 #include <cctype>
 #include <cstring>
-#include <mutex>
-#include <string>
 #include <utility>
 #include <stdlib.h>
 
 #include <wx/log.h>
 
-// boost:mt19937 is not thread-safe
-static std::mutex                                           rng_mutex;
-
+// Use thread_local because boost:mt19937 is not thread-safe
 // Static rng and generators are used because the overhead of constant seeding is expensive
 // We rely on the default non-arg constructor of basic_random_generator to provide a random seed.
 // We use a separate rng object for cases where we want to control the basic_random_generator
 // initial seed by calling SeedGenerator from unit tests and other special cases.
-static boost::mt19937                                       rng;
-static boost::uuids::basic_random_generator<boost::mt19937> randomGenerator;
+static thread_local boost::mt19937                                       rng;
+static thread_local boost::uuids::basic_random_generator<boost::mt19937> randomGenerator;
 
 // These don't have the same performance penalty, but we might as well be consistent
 static boost::uuids::string_generator                       stringGenerator;
@@ -63,8 +60,9 @@ static boost::uuids::nil_generator                          nilGenerator;
 KIID niluuid( 0 );
 
 
-// When true, always create nil uuids for performance, when valid ones aren't needed
-static bool g_createNilUuids = false;
+// When true, always create nil uuids for performance, when valid ones aren't needed.
+// Thread-local to prevent background library loading from affecting other threads.
+static thread_local bool g_createNilUuids = false;
 
 
 // For static initialization
@@ -88,7 +86,6 @@ KIID::KIID()
         }
         else
         {
-            std::lock_guard<std::mutex> lock( rng_mutex );
             m_uuid = randomGenerator();
         }
 
@@ -238,6 +235,18 @@ size_t KIID::Hash() const
     return boost::uuids::hash_value( m_uuid );
 }
 
+KIID KIID::FromName( const std::string& aName )
+{
+    // Arbitrary but fixed namespace, the same name must map to the same KIID forever
+    static const boost::uuids::uuid nsUuid = stringGenerator( "8b8b58e2-3d21-4a24-9dcf-42e0f14001a2" );
+
+    boost::uuids::name_generator_sha1 nameGenerator( nsUuid );
+
+    KIID id( 0 );
+    id.m_uuid = nameGenerator( aName );
+    return id;
+}
+
 
 void KIID::Clone( const KIID& aUUID )
 {
@@ -311,20 +320,9 @@ void KIID::SeedGenerator( unsigned int aSeed )
 }
 
 
-// Snapshot / rewind the process-global KIID generator position. The RL router's
-// checkpoint captures this at checkpoint time and its restore()/restoreIncremental()
-// rewinds it, so a routing action replayed after a restore mints the IDENTICAL UUID
-// stream a fresh run would — otherwise the generator (seeded once at construction,
-// never reset on restore) keeps advancing, post-restore items get different UUIDs,
-// and the UUID-based obstacle tie-break (canonicalItemCompare) diverges.
-//
-// The state is carried as an OPAQUE byte blob (not text): boost::mt19937 is a value
-// type (a UIntType array + position index, no pointers), so memcpy round-trips it
-// bit-exactly with no locale/formatting/parsing risk. `randomGenerator` holds `rng`
-// by reference, so `rng` is the live drawn-from state — memcpy of `&rng` captures it.
+// Snapshot and restore the caller's thread-local engine; the RL router does both on its routing thread.
 std::string KIID::GetGeneratorState()
 {
-    std::lock_guard<std::mutex> lock( rng_mutex );
     return std::string( reinterpret_cast<const char*>( &rng ), sizeof( rng ) );
 }
 
@@ -334,10 +332,7 @@ void KIID::SetGeneratorState( const std::string& aState )
     if( aState.size() != sizeof( rng ) )
         return;   // empty (pre-first-checkpoint) or size mismatch → leave generator as-is
 
-    std::lock_guard<std::mutex> lock( rng_mutex );
     std::memcpy( &rng, aState.data(), sizeof( rng ) );
-    // Rebuild the UUID generator from the rewound engine (mirrors SeedGenerator);
-    // harmless even though basic_random_generator references rng by pointer.
     randomGenerator = boost::uuids::basic_random_generator<boost::mt19937>( rng );
 }
 

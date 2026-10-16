@@ -171,6 +171,7 @@ bool ROUTER::StartDragging( const VECTOR2I& aP, ITEM* aItem, int aDragMode )
 bool ROUTER::StartDragging( const VECTOR2I& aP, ITEM_SET aStartItems, int aDragMode )
 {
     m_leaderSegments.clear();
+    SetFailureReason( wxEmptyString );
 
     if( aStartItems.Empty() )
         return false;
@@ -359,6 +360,10 @@ bool ROUTER::isStartingPointRoutable( const VECTOR2I& aWhere, ITEM* aStartItem, 
             SetFailureReason( errorMsg );
             return false;
         }
+        // We intentionally do not reject a start point whose existing gap differs from the
+        // configured diff pair gap. Starting inside a neckdown area (e.g. a narrowed gap under a
+        // BGA) and widening out to the netclass gap is a legitimate workflow. The placer fits the
+        // widening transition starting from the existing anchor pair.
 
         SHAPE_LINE_CHAIN dummyStartSegA;
         SHAPE_LINE_CHAIN dummyStartSegB;
@@ -496,7 +501,7 @@ bool ROUTER::Move( const VECTOR2I& aP, ITEM* endItem )
 }
 
 
-bool ROUTER::getNearestRatnestAnchor( VECTOR2I& aOtherEnd, PNS_LAYER_RANGE& aOtherEndLayers,
+bool ROUTER::GetNearestRatnestAnchor( VECTOR2I& aOtherEnd, PNS_LAYER_RANGE& aOtherEndLayers,
                                       ITEM*& aOtherEndItem )
 {
     // Can't finish something with no connections
@@ -568,7 +573,7 @@ bool ROUTER::Finish( int aMaxAttempts )
     ITEM*       otherEndItem = nullptr;
 
     // Get the anchor nearest to the end of the trace the user is routing
-    if( !getNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
+    if( !GetNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
         return false;
 
     // Keep moving until we don't change position or hit the limit.
@@ -615,7 +620,7 @@ bool ROUTER::ContinueFromEnd( ITEM** aNewStartItem )
     ITEM*       otherEndItem = nullptr;
 
     // Get the anchor nearest to the end of the trace the user is routing
-    if( !getNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
+    if( !GetNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
         return false;
 
     CommitRouting();
@@ -661,8 +666,11 @@ void ROUTER::markViolations( NODE* aNode, ITEM_SET& aCurrent, NODE::ITEM_VECTOR&
 
                 clearance = aNode->GetClearance( currentItem, itemToMark );
 
-                if( itemToMark->Layers().IsMultilayer() && !currentItem->Layers().IsMultilayer() )
+                if( itemToMark->Layers().IsMultilayer() && !currentItem->Layers().IsMultilayer()
+                    && !itemToMark->HasUniqueShapeLayers() )
+                {
                     tmp->SetLayer( currentItem->Layer() );
+                }
 
                 if( itemToMark->IsCompoundShapePrimitive() )
                 {
@@ -729,7 +737,15 @@ void ROUTER::updateView( NODE* aNode, ITEM_SET& aCurrent, bool aDragging )
     if( !aNode )
         return;
 
-    markViolations( aNode, aCurrent, removed );
+    // hack: we only mark violations when routing, not when length tuning - as the length tuner
+    // by design can never generate clearance violations. Since markViolations() calls multiple
+    // collision/clearance queries, it can be extremely expensive with certain custom DRC rules
+    // (rule area/courtyard-based, see issue #24052 for examples)
+    if( m_mode == PNS_MODE_ROUTE_SINGLE ||
+        m_mode == PNS_MODE_ROUTE_DIFF_PAIR )
+    {
+        markViolations( aNode, aCurrent, removed );
+    }
 
     aNode->GetUpdatedItems( removed, added );
 

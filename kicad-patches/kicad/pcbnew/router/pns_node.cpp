@@ -26,12 +26,14 @@
 #include <vector>
 #include <cassert>
 #include <utility>
+#include <thread_pool.h>
 
 #include <math/vector2d.h>
 
 #include <geometry/seg.h>
 #include <geometry/shape_line_chain.h>
 #include <zone.h>
+#include <pcb_track.h>
 
 #include <wx/log.h>
 // PCBWorld-mod begin 2026-09-01
@@ -431,8 +433,7 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
                                           const COLLISION_SEARCH_OPTIONS& aOpts )
 {
     DIRECTION_45::CORNER_MODE cornerMode = ROUTER::GetInstance()->Settings().GetCornerMode();
-    const int                 clearanceEpsilon = GetRuleResolver()->ClearanceEpsilon();
-    OBSTACLES                 obstacleList;
+    OBSTACLES                 obstacleSet;
 
     for( int i = 0; i < aLine->CLine().SegmentCount(); i++ )
     {
@@ -441,14 +442,147 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
         // Disabling the cache will lead to slowness.
 
         const SEGMENT s( *aLine, aLine->CLine().CSegment( i ) );
-        QueryColliding( &s, obstacleList, aOpts );
+        QueryColliding( &s, obstacleSet, aOpts );
     }
 
     if( aLine->EndsWithVia() )
-        QueryColliding( &aLine->Via(), obstacleList, aOpts );
+        QueryColliding( &aLine->Via(), obstacleSet, aOpts );
 
-    if( obstacleList.empty() )
+    if( obstacleSet.empty() )
         return OPT_OBSTACLE();
+
+    // Convert to indexed vector for parallel access.
+    std::vector<OBSTACLE> obstacles( obstacleSet.begin(), obstacleSet.end() );
+    const int             numObstacles = (int) obstacles.size();
+
+    const int      layer = aLine->Layer();
+    RULE_RESOLVER* ruleResolver = GetRuleResolver();
+    const bool     simplifyHull = ( cornerMode == DIRECTION_45::MITERED_90
+                                    || cornerMode == DIRECTION_45::ROUNDED_90 );
+    const bool     hasVia = aLine->EndsWithVia();
+
+    auto makeHull = [&]( const SHAPE_LINE_CHAIN& cachedHull ) -> SHAPE_LINE_CHAIN
+    {
+        if( simplifyHull )
+        {
+            BOX2I            bbox = cachedHull.BBox();
+            SHAPE_LINE_CHAIN hull;
+            hull.Append( bbox.GetLeft(),  bbox.GetTop()    );
+            hull.Append( bbox.GetRight(), bbox.GetTop()    );
+            hull.Append( bbox.GetRight(), bbox.GetBottom() );
+            hull.Append( bbox.GetLeft(),  bbox.GetBottom() );
+            hull.SetClosed( true );
+            return hull;
+        }
+
+        return cachedHull;
+    };
+
+    // The first step here is sequential since GetClearance() and HullCache() are not thread-safe.
+    // So, we populate all caches first and copy the returned hull references into owned values
+    // before releasing the sequential phase.
+    struct ObstacleHullData
+    {
+        SHAPE_LINE_CHAIN lineHull;
+        SHAPE_LINE_CHAIN viaHull; // only populated when hasVia
+    };
+
+    std::vector<ObstacleHullData> hullData( numObstacles );
+
+    for( int i = 0; i < numObstacles; i++ )
+    {
+        const OBSTACLE& obstacle = obstacles[i];
+
+        int clearance = GetClearance( obstacle.m_item, aLine, aOpts.m_useClearanceEpsilon )
+                            + aLine->Width() / 2;
+
+        hullData[i].lineHull = makeHull( ruleResolver->HullCache( obstacle.m_item, clearance,
+                                                                   0, layer ) );
+
+        if( hasVia )
+        {
+            const VIA& via = aLine->Via();
+            int viaClearance = GetClearance( obstacle.m_item, &via, aOpts.m_useClearanceEpsilon )
+                               + via.Diameter( aLine->Layer() ) / 2;
+
+            hullData[i].viaHull = makeHull( ruleResolver->HullCache( obstacle.m_item,
+                                                                      viaClearance, 0, layer ) );
+        }
+    }
+
+    // Run the obstacle finding in parallel and bring the results together afte
+    struct ObstacleResult
+    {
+        int      dist = INT_MAX;
+        VECTOR2I ip;
+    };
+
+    std::vector<ObstacleResult> results( numObstacles );
+    const SHAPE_LINE_CHAIN&     linePath = aLine->CLine();
+
+    auto processObstacle = [&]( int i )
+    {
+        std::vector<SHAPE_LINE_CHAIN::INTERSECTION> ips;
+        ObstacleResult& result = results[i];
+
+        HullIntersection( hullData[i].lineHull, linePath, ips );
+
+        for( const SHAPE_LINE_CHAIN::INTERSECTION& ip : ips )
+        {
+            if( !ip.valid )
+                continue;
+
+            int dist = linePath.PathLength( ip.p, ip.index_their );
+
+            if( dist < result.dist )
+            {
+                result.dist = dist;
+                result.ip = ip.p;
+            }
+        }
+
+        if( hasVia )
+        {
+            ips.clear();
+            HullIntersection( hullData[i].viaHull, linePath, ips );
+
+            for( const SHAPE_LINE_CHAIN::INTERSECTION& ip : ips )
+            {
+                if( !ip.valid )
+                    continue;
+
+                int dist = linePath.PathLength( ip.p, ip.index_their );
+
+                if( dist < result.dist )
+                {
+                    result.dist = dist;
+                    result.ip = ip.p;
+                }
+            }
+        }
+    };
+
+    // Each task submission locks the thread pool's priority queue mutex, and thread wakeup
+    // latency is ~5-20µs. With too few items per block the synchronization cost exceeds the
+    // geometry work. Use a minimum chunk size so blocks are always worth dispatching, while
+    // still entering the parallel path at a lower obstacle count than a flat threshold allows.
+    constexpr int MIN_OBSTACLES_PER_BLOCK = 8;
+    constexpr int PARALLEL_THRESHOLD      = MIN_OBSTACLES_PER_BLOCK;
+
+    if( numObstacles > PARALLEL_THRESHOLD )
+    {
+        thread_pool& tp       = GetKiCadThreadPool();
+        std::size_t numBlocks = std::max<std::size_t>( 1, numObstacles / MIN_OBSTACLES_PER_BLOCK );
+
+        auto futures = tp.submit_loop( 0, numObstacles, [&]( int i ) { processObstacle( i ); },
+                                       numBlocks );
+        futures.wait();
+    }
+    else
+    {
+        for( int i = 0; i < numObstacles; i++ )
+            processObstacle( i );
+    }
 
     OBSTACLE nearest;
     nearest.m_head = nullptr;
@@ -456,92 +590,21 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
     nearest.m_distFirst = INT_MAX;
     nearest.m_maxFanoutWidth = 0;
 
-    auto updateNearest =
-            [&]( const SHAPE_LINE_CHAIN::INTERSECTION& pt, const OBSTACLE& obstacle )
-            {
-                int dist = aLine->CLine().PathLength( pt.p, pt.index_their );
-
-                if( dist < nearest.m_distFirst )
-                {
-                    nearest = obstacle;
-                    nearest.m_distFirst = dist;
-                    nearest.m_ipFirst = pt.p;
-                }
-            };
-
-    SHAPE_LINE_CHAIN obstacleHull;
-    DEBUG_DECORATOR* debugDecorator = ROUTER::GetInstance()->GetInterface()->GetDebugDecorator();
-    std::vector<SHAPE_LINE_CHAIN::INTERSECTION> intersectingPts;
-    int layer = aLine->Layer();
-
-    for( const OBSTACLE& obstacle : obstacleList )
+    for( int i = 0; i < numObstacles; i++ )
     {
-        int clearance = GetClearance( obstacle.m_item, aLine, aOpts.m_useClearanceEpsilon )
-                            + aLine->Width() / 2;
-
-        obstacleHull = obstacle.m_item->Hull( clearance, 0, layer );
-
-        if( cornerMode == DIRECTION_45::MITERED_90 || cornerMode == DIRECTION_45::ROUNDED_90 )
+        if( results[i].dist < nearest.m_distFirst )
         {
-            BOX2I bbox = obstacleHull.BBox();
-            obstacleHull.Clear();
-            obstacleHull.Append( bbox.GetLeft(),  bbox.GetTop()    );
-            obstacleHull.Append( bbox.GetRight(), bbox.GetTop()    );
-            obstacleHull.Append( bbox.GetRight(), bbox.GetBottom() );
-            obstacleHull.Append( bbox.GetLeft(),  bbox.GetBottom() );
-            // PCBWorld-mod begin 2026-09-01
-            // Upstream leaves this chain open after Clear(); PointInside() then rejects every
-            // point and the 90-degree walkaround can never get around the obstacle.
-            obstacleHull.SetClosed( true );
-            // PCBWorld-mod end
-        }
-        //debugDecorator->AddLine( obstacleHull, 2, 40000, "obstacle-hull-test" );
-        //debugDecorator->AddLine( aLine->CLine(), 5, 40000, "obstacle-test-line" );
+            nearest = obstacles[i];
+            nearest.m_distFirst = results[i].dist;
+            nearest.m_ipFirst = results[i].ip;
 
-        intersectingPts.clear();
-        HullIntersection( obstacleHull, aLine->CLine(), intersectingPts );
-
-        for( const auto& ip : intersectingPts )
-        {
-            //debugDecorator->AddPoint( ip.p, ip.valid?3:6, 100000, (const char *) wxString::Format("obstacle-isect-point-%d" ).c_str() );
-            if( ip.valid )
-                updateNearest( ip, obstacle );
-        }
-
-        if( aLine->EndsWithVia() )
-        {
-            const VIA& via = aLine->Via();
-            int viaClearance = GetClearance( obstacle.m_item, &via, aOpts.m_useClearanceEpsilon )
-                               + via.Diameter( aLine->Layer() ) / 2;
-
-            obstacleHull = obstacle.m_item->Hull( viaClearance, 0, layer );
-
-            if( cornerMode == DIRECTION_45::MITERED_90 || cornerMode == DIRECTION_45::ROUNDED_90 )
-            {
-                BOX2I bbox = obstacleHull.BBox();
-                obstacleHull.Clear();
-                obstacleHull.Append( bbox.GetLeft(),  bbox.GetTop()    );
-                obstacleHull.Append( bbox.GetRight(), bbox.GetTop()    );
-                obstacleHull.Append( bbox.GetRight(), bbox.GetBottom() );
-                obstacleHull.Append( bbox.GetLeft(),  bbox.GetBottom() );
-                // PCBWorld-mod begin 2026-09-01
-                // Upstream leaves this chain open after Clear(); PointInside() then rejects every
-                // point and the 90-degree walkaround can never get around the obstacle.
-                obstacleHull.SetClosed( true );
-                // PCBWorld-mod end
-            }
-            //debugDecorator->AddLine( obstacleHull, 3 );
-
-            intersectingPts.clear();
-            HullIntersection( obstacleHull, aLine->CLine(), intersectingPts );
-
-            for( const SHAPE_LINE_CHAIN::INTERSECTION& ip : intersectingPts )
-                updateNearest( ip, obstacle );
+            if( results[i].dist == 0 )
+                break;
         }
     }
 
     if( nearest.m_distFirst == INT_MAX )
-        nearest = (*obstacleList.begin());
+        nearest = obstacles[0];
 
     return nearest;
 }
@@ -1281,11 +1344,13 @@ void NODE::Remove( LINE& aLine )
 
 void NODE::followLine( LINKED_ITEM* aCurrent, bool aScanDirection, int& aPos, int aLimit,
                        VECTOR2I* aCorners, LINKED_ITEM** aSegments, bool* aArcReversed,
-                       bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments )
+                       bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments,
+                       bool aAllowSegmentSizeMismatch )
 {
     bool prevReversed = false;
 
     const VECTOR2I guard = aCurrent->Anchor( aScanDirection );
+    const int      startWidth = aCurrent->Width();
 
     for( int count = 0 ; ; ++count )
     {
@@ -1324,11 +1389,12 @@ void NODE::followLine( LINKED_ITEM* aCurrent, bool aScanDirection, int& aPos, in
         if( locked || aPos < 0 || aPos == aLimit )
             break;
 
-        aCurrent = jt->NextSegment( aCurrent, aFollowLockedSegments );
+        LINKED_ITEM* next = jt->NextSegment( aCurrent, aFollowLockedSegments );
 
-        if( !aCurrent )
+        if( !next || ( !aAllowSegmentSizeMismatch && next->Width() != startWidth ) )
             break;
 
+        aCurrent = next;
         prevReversed = ( aCurrent && jt->Pos() == aCurrent->Anchor( aScanDirection ) );
     }
 }
@@ -1357,12 +1423,12 @@ const LINE NODE::AssembleLine( LINKED_ITEM* aSeg, int* aOriginSegmentIndex, bool
     pl.SetOwner( this );
 
     followLine( aSeg, false, i_start, MaxVerts, corners.data(), segs.data(), arcReversed.data(),
-                guardHit, aStopAtLockedJoints, aFollowLockedSegments );
+                guardHit, aStopAtLockedJoints, aFollowLockedSegments, aAllowSegmentSizeMismatch );
 
     if( !guardHit )
     {
         followLine( aSeg, true, i_end, MaxVerts, corners.data(), segs.data(), arcReversed.data(),
-                    guardHit, aStopAtLockedJoints, aFollowLockedSegments );
+                    guardHit, aStopAtLockedJoints, aFollowLockedSegments, aAllowSegmentSizeMismatch );
     }
 
     int n = 0;
@@ -1377,9 +1443,6 @@ const LINE NODE::AssembleLine( LINKED_ITEM* aSeg, int* aOriginSegmentIndex, bool
         const VECTOR2I& p  = corners[i];
         LINKED_ITEM*    li = segs[i];
 
-        if( !aAllowSegmentSizeMismatch && ( li && li->Width() != aSeg->Width() ) )
-            continue;
-
         if( !li || li->Kind() != ITEM::ARC_T )
             line.Append( p );
 
@@ -1389,10 +1452,6 @@ const LINE NODE::AssembleLine( LINKED_ITEM* aSeg, int* aOriginSegmentIndex, bool
             {
                 const ARC*       arc = static_cast<const ARC*>( li );
                 const SHAPE_ARC* sa  = static_cast<const SHAPE_ARC*>( arc->Shape( -1 ) );
-
-                int      nSegs     = line.PointCount();
-                VECTOR2I last      = nSegs ? line.CPoint( -1 ) : VECTOR2I();
-                ssize_t lastShape = nSegs ? line.ArcIndex( static_cast<ssize_t>( nSegs ) - 1 ) : -1;
 
                 line.Append( arcReversed[i] ? sa->Reversed() : *sa );
             }
@@ -1422,13 +1481,13 @@ const LINE NODE::AssembleLine( LINKED_ITEM* aSeg, int* aOriginSegmentIndex, bool
     wxASSERT_MSG( pl.SegmentCount() != 0, "assembled line should never be empty" );
 
     return pl;
-}
 
+}
 
 void NODE::FindLineEnds( const LINE& aLine, JOINT& aA, JOINT& aB )
 {
     aA = *FindJoint( aLine.CPoint( 0 ), &aLine );
-    aB = *FindJoint( aLine.CPoint( -1 ), &aLine );
+    aB = *FindJoint( aLine.CLastPoint(), &aLine );
 }
 
 
@@ -1468,21 +1527,6 @@ int NODE::FindLinesBetweenJoints( const JOINT& aA, const JOINT& aB, std::vector<
 
 void NODE::FixupVirtualVias()
 {
-    // PCBWorld-mod begin 2026-09-01
-    // Idempotent: drop any virtual vias synthesized by a previous call before
-    // re-deriving, so this is safe to re-run on a live world (e.g. after an
-    // incremental RL restore) without accumulating duplicate VVIAs. On a fresh
-    // SyncWorld node there are none yet, so this loop is a no-op on that path.
-    std::vector<ITEM*> staleVvias;
-
-    for( ITEM* item : *m_index )
-        if( item->IsVirtual() )
-            staleVvias.push_back( item );
-
-    for( ITEM* item : staleVvias )
-        Remove( item );
-
-    // PCBWorld-mod end
     const SEGMENT* locked_seg = nullptr;
     std::vector<VVIA*> vvias;
 
@@ -1565,7 +1609,7 @@ void NODE::FixupVirtualVias()
 
     for( auto vvia : vvias )
     {
-        Add( ItemCast<VIA>( std::move( std::unique_ptr<VVIA>( vvia ) ) ) );
+        Add( ItemCast<VIA>( std::unique_ptr<VVIA>( vvia ) ) );
     }
 }
 

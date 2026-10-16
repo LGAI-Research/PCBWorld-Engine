@@ -609,16 +609,22 @@ void RL_TRACKS_CLEANER::cleanup( bool aDeleteDuplicateVias, bool aDeleteNullSegm
 
 const std::vector<BOARD_CONNECTED_ITEM*>& RL_TRACKS_CLEANER::getConnectedItems( PCB_TRACK* aTrack )
 {
-    static const std::vector<KICAD_T> connectedTypes = { PCB_TRACE_T,
-                                                         PCB_ARC_T,
-                                                         PCB_VIA_T,
-                                                         PCB_PAD_T,
-                                                         PCB_ZONE_T };
-
     const std::shared_ptr<CONNECTIVITY_DATA>& connectivity = m_brd->GetConnectivity();
 
     if( !m_connectedItemsCache.contains( aTrack ) )
-        m_connectedItemsCache[aTrack] = connectivity->GetConnectedItems( aTrack, connectedTypes );
+    {
+        std::vector<BOARD_CONNECTED_ITEM*>& items = m_connectedItemsCache[aTrack];
+        items = connectivity->GetConnectedItems( aTrack );
+        items.erase( std::remove_if( items.begin(), items.end(),
+                                     []( BOARD_CONNECTED_ITEM* item )
+                                     {
+                                         KICAD_T type = item->Type();
+                                         return type != PCB_TRACE_T && type != PCB_ARC_T
+                                                && type != PCB_VIA_T && type != PCB_PAD_T
+                                                && type != PCB_ZONE_T;
+                                     } ),
+                     items.end() );
+    }
 
     return m_connectedItemsCache.at( aTrack );
 }
@@ -752,7 +758,7 @@ bool RL_TRACKS_CLEANER::mergeCollinearSegments( PCB_TRACK* aSeg1, PCB_TRACK* aSe
 
     if( !m_spec.dry_run )
     {
-        PCB_GROUP* group = aSeg1->GetParentGroup();
+        EDA_GROUP* group = aSeg1->GetParentGroup();
         *aSeg1 = dummy_seg;
         aSeg1->SetParentGroup( group );
 

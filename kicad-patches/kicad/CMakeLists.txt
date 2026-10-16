@@ -23,10 +23,10 @@
 #
 
 if( MSVC )
-    # CMake 3.28.1 or higher required for MSVC ARM builds for armasm64.exe support
-    cmake_minimum_required( VERSION 3.28.1 FATAL_ERROR )
+# CMake 3.28.1 or higher required for MSVC ARM builds for armasm64.exe support
+cmake_minimum_required( VERSION 3.28.1 FATAL_ERROR )
 else()
-    cmake_minimum_required( VERSION 3.21 FATAL_ERROR )
+cmake_minimum_required( VERSION 3.22 FATAL_ERROR )
 endif()
 
 # Generate DEPFILES without transforming relative paths
@@ -53,6 +53,7 @@ project( kicad )
 
 # Create a default build type for our QA that doesn't include `NDEBUG`
 set(CMAKE_CXX_FLAGS_QABUILD "-Os -g1 -ggdb1")
+string( APPEND CMAKE_EXE_LINKER_FLAGS_QABUILD " -rdynamic" )
 
 include( GNUInstallDirs )
 include( CMakeDependentOption )
@@ -67,6 +68,21 @@ set( CMAKE_MODULE_PATH       "${KICAD_CMAKE_MODULE_PATH}" )
 
 include( ConfigurePlatform )
 
+
+if( WIN32 )
+    # Without WIN32_LEAN_AND_MEAN defined including windows.h pulls in legacy
+    # winsocks.h which conflicts with winsocks2.h used by modern libraries such
+    # as curl.
+    # There is no harm in defining this globally, at worst some additional
+    # headers have to be included explicitly.
+    add_compile_definitions( WIN32_LEAN_AND_MEAN )
+endif()
+
+if( APPLE )
+    # Apple, in their infinite wisdom, has decided to mark OpenGL as deprecated.
+    # Luckily we can silence warnings about its deprecation.
+    add_compile_definitions( GL_SILENCE_DEPRECATION=1 )
+endif()
 # Create a flag to identify the non-Apple unix systems
 if( UNIX AND NOT APPLE )
     set( UNIX_NOT_APPLE ON )
@@ -120,20 +136,9 @@ option( KICAD_UPDATE_CHECK
     "Build in update check"
     ON )
 
-# EGL is only needed on Linux with Wayland
-cmake_dependent_option( KICAD_USE_EGL
-    "Build KiCad with EGL backend support for Wayland."
-    OFF "UNIX_NOT_APPLE"
-    OFF)
-
-cmake_dependent_option( KICAD_USE_BUNDLED_GLEW
-    "Use the bundled version of GLEW - only available when KICAD_USE_EGL is set"
-    ON "KICAD_USE_EGL"
-    OFF )
-
 cmake_dependent_option( KICAD_WAYLAND
     "Support Wayland features"
-    ON "KICAD_USE_EGL"
+    ON "UNIX_NOT_APPLE"
     OFF )
 
 # Options to build with flatpak platform defaults (only on Linux)
@@ -189,7 +194,12 @@ option( KICAD_I18N_UNIX_STRICT_PATH
 cmake_dependent_option( KICAD_WIN32_INSTALL_PDBS
     "Installs debug pdb to the bin folder, DO NOT USE (NOR REQUIRED) FOR DEBUGGING THE SOURCE ON MSVC. This is purely for release building.
     MSVC can find the PDBs without this."
-    OFF "WIN32"
+    OFF "MSVC"
+    OFF )
+
+cmake_dependent_option( KICAD_MSVC_DYNDEOPT
+    "Builds release builds with /dynamicdeopt for dynamic debugging."
+    OFF "MSVC"
     OFF )
 
 ####################################
@@ -215,6 +225,18 @@ option( KICAD_STDLIB_DEBUG
     "Build KiCad with libstdc++ debug flags enabled."
     OFF )
 
+
+# KICAD_STDLIB_DEBUG enables _GLIBCXX_DEBUG which changes the ABI of standard library
+# containers. System Boost libraries are typically built without this flag, causing
+# crashes in QA tests that link to Boost::unit_test_framework due to ABI mismatch.
+if( KICAD_STDLIB_DEBUG AND KICAD_BUILD_QA_TESTS )
+    message( WARNING
+        "KICAD_STDLIB_DEBUG is enabled with KICAD_BUILD_QA_TESTS.\n"
+        "_GLIBCXX_DEBUG changes the ABI of standard library containers, which causes "
+        "crashes when linking against system Boost libraries that were built without "
+        "this flag. QA tests will likely crash at runtime.\n"
+        "Either disable KICAD_STDLIB_DEBUG or set KICAD_BUILD_QA_TESTS=OFF." )
+endif()
 option( KICAD_STDLIB_LIGHT_DEBUG
     "Build KiCad with libstdc++ with -Wp,-D_GLIBCXX_ASSERTIONS flag enabled. Not as intrusive as KICAD_STDLIB_DEBUG"
     OFF )
@@ -229,6 +251,10 @@ cmake_dependent_option( KICAD_WIN32_LTCG
     OFF "WIN32"
     OFF )
 
+
+option( KICAD_USE_PCH
+    "Enable precompiled header support"
+    ON )
 # Advanced option to make link maps (only available on linux)
 cmake_dependent_option( KICAD_MAKE_LINK_MAPS
     "Create link maps for artifacts"
@@ -282,6 +308,20 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Check if the current generator is multi-config (Ninja Multi-Config, Visual Studio, Xcode)
+get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+
+# Set KICMAKE_CFG_INTDIR to the appropriate configuration directory
+# This is meant to emulate CMAKE_CFG_INTDIR which is deprecated
+# but it's functionality to default to "." for single-config generators is important
+# and not available with $<CONFIG>
+if(IS_MULTI_CONFIG)
+    set(KICMAKE_CFG_INTDIR "$<CONFIG>")
+else()
+    # For single-config generators (Ninja, Makefiles), default to "."
+    set(KICMAKE_CFG_INTDIR ".")
+endif()
+
 # Pass defines into KiCad code based on the build options set
 add_compile_definitions( $<$<BOOL:${KICAD_SCRIPTING_WXPYTHON}>:KICAD_SCRIPTING_WXPYTHON> )
 add_compile_definitions( $<$<BOOL:${KICAD_SIGNAL_INTEGRITY}>:KICAD_SIGNAL_INTEGRITY> )
@@ -291,15 +331,7 @@ add_compile_definitions( $<$<BOOL:${KICAD_GAL_PROFILE}>:KICAD_GAL_PROFILE> )
 add_compile_definitions( $<$<BOOL:${KICAD_WIN32_VERIFY_CODESIGN}>:KICAD_WIN32_VERIFY_CODESIGN> )
 add_compile_definitions( $<$<BOOL:${KICAD_UPDATE_CHECK}>:KICAD_UPDATE_CHECK> )
 
-if( KICAD_USE_EGL )
-    message( STATUS "Configuring KiCad for the wxGLCanvas EGL backend" )
-    add_compile_definitions( KICAD_USE_EGL )
-endif()
 
-if( KICAD_WAYLAND )
-    message( STATUS "Configuring KiCad to support Wayland features" )
-    add_compile_definitions( KICAD_WAYLAND )
-endif()
 
 if( KICAD_IPC_API )
     add_definitions( -DKICAD_IPC_API )
@@ -559,6 +591,11 @@ if( MSVC )
     # but we want to turn it on to enable debug performance improvements available under C++17 in MSVC 17.5+
     string( APPEND CMAKE_CXX_FLAGS " /permissive-" )
 
+    if( KICAD_MSVC_DYNDEOPT )
+        string( APPEND CMAKE_CXX_FLAGS_RELEASE " /dynamicdeopt" )
+        string( APPEND CMAKE_CXX_FLAGS_RELWITHDEBINFO " /dynamicdeopt" )
+    endif()
+
     # Exception handling
     # Remove the potential default EHsc option cmake doesn't allow us to remove easily
     string( REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} )
@@ -587,11 +624,20 @@ if( MSVC )
         # /DEBUG: create PDB
         string( APPEND CMAKE_${type}_LINKER_FLAGS " /DEBUG /MANIFEST:NO" )
         # /OPT:REF: omit unreferenced code
-        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /OPT:REF /MANIFEST:NO" )
-        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /OPT:REF /MANIFEST:NO" )
-        # /OPT:ICF: fold common data
-        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /OPT:ICF /MANIFEST:NO" )
-        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /OPT:ICF /MANIFEST:NO" )
+        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /OPT:REF" )
+        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /OPT:REF" )
+        # /MANIFEST:NO
+        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /MANIFEST:NO" )
+        string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /MANIFEST:NO" )
+
+        if( KICAD_MSVC_DYNDEOPT )
+            string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /dynamicdeopt" )
+            string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /dynamicdeopt" )
+        else()
+            # /OPT:ICF: fold common data
+            string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /OPT:ICF" )
+            string( APPEND CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO " /OPT:ICF" )
+        endif()
 
         if( KICAD_WIN32_LTCG )
             # we are implementing this manually because CMake's LTCG option is incomplete
@@ -599,6 +645,11 @@ if( MSVC )
             string( APPEND CMAKE_${type}_LINKER_FLAGS_RELEASE " /LTCG" )
         endif()
     endforeach()
+
+    if( KICAD_MSVC_DYNDEOPT )
+        string( APPEND CMAKE_STATIC_LINKER_FLAGS_RELEASE " /dynamicdeopt" )
+        string( APPEND CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO " /dynamicdeopt" )
+    endif()
 
     # Let cl.exe parallelize builds
     if( KICAD_WIN32_BUILD_PARALLEL_CL_MP )
@@ -761,43 +812,6 @@ if( KICAD_BUILD_I18N )
 endif()
 
 #
-# Find OpenGL library, required
-#
-if( KICAD_USE_EGL )
-    find_package( OpenGL REQUIRED COMPONENTS OpenGL EGL )
-else()
-    set( OpenGL_GL_PREFERENCE "LEGACY" )     # CMake 3.11+ setting; see 'cmake --help-policy CMP0072'
-    find_package( OpenGL REQUIRED )
-endif()
-
-#
-# Find GLEW library, required
-#
-# The EGL canvas on GTK requires the use of a GLEW version compiled with an EGL flag.
-# The one built in the thirdparty directory has the flag for EGL set, so we use it unless told
-# otherwise. Then we search for the system GLEW version and use that instead.
-#
-if( KICAD_USE_EGL AND KICAD_USE_BUNDLED_GLEW AND UNIX AND NOT APPLE )
-    if( OpenGL_EGL_FOUND )
-        message( STATUS "Found OpenGL EGL library: ${OPENGL_egl_LIBRARY}" )
-    else()
-        message( FATAL_ERROR "OpenGL EGL library not found" )
-    endif()
-
-    # Add the custom GLEW target
-    add_subdirectory( thirdparty/glew )
-
-    # Set the standard package variables to point to our custom target to mimic the system version.
-    set( GLEW_LIBRARIES glew )
-    set( GLEW_FOUND TRUE )
-    include_directories( SYSTEM $<TARGET_PROPERTY:glew,INCLUDE_DIRECTORIES> )
-else()
-    find_package( GLEW REQUIRED )
-    check_find_package_result( GLEW_FOUND "GLEW" )
-    include_directories( SYSTEM ${GLEW_INCLUDE_DIR} )
-endif()
-
-#
 # Find GLM library, required
 #
 find_package( GLM 0.9.8 REQUIRED )
@@ -819,6 +833,11 @@ find_package(ZSTD REQUIRED)
 #
 find_package( CURL REQUIRED )
 
+if( UNIX AND NOT APPLE )
+    find_package( SPNAV REQUIRED )
+    include_directories( SYSTEM ${SPNAV_INCLUDE_DIR} )
+endif()
+
 #
 # Find Cairo library, required
 #
@@ -829,7 +848,7 @@ find_package( Pixman 0.30 REQUIRED )
 include_directories( SYSTEM ${PIXMAN_INCLUDE_DIR} )
 
 # Find libgit2, required
-find_package( libgit2 REQUIRED )
+find_package( libgit2 1.5 REQUIRED )
 
 # Set include directories for libgit
 include_directories(${LIBGIT2_INCLUDE_DIRS})
@@ -880,24 +899,37 @@ if( OCC_FOUND )
     endif()
 endif()
 
-if( KICAD_USE_CMAKE_FINDPROTOBUF )
+# Try to find Protobuf with modern approach first, fallback to legacy if needed
+set( _protobuf_found FALSE )
+
+if( NOT KICAD_USE_CMAKE_FINDPROTOBUF )
+    message( STATUS "Attempting to find Protobuf using CONFIG mode..." )
+    find_package( Protobuf QUIET CONFIG )
+    if( Protobuf_FOUND )
+        set( Protobuf_LIBRARY "protobuf::libprotobuf" )
+        set( _protobuf_found TRUE )
+        message( STATUS "Found Protobuf using CONFIG mode" )
+    else()
+        message( STATUS "CONFIG mode failed, falling back to FindProtobuf.cmake" )
+        set( KICAD_USE_CMAKE_FINDPROTOBUF ON )
+    endif()
+endif()
+
+if( NOT _protobuf_found )
+    message( STATUS "Using FindProtobuf.cmake to locate Protobuf..." )
     include( FindProtobuf )
     find_package( Protobuf REQUIRED )
-else()
-    find_package( Protobuf REQUIRED CONFIG )
-    set( Protobuf_LIBRARY "protobuf::libprotobuf" )
+    if( Protobuf_FOUND )
+        message( STATUS "Found Protobuf using FindProtobuf.cmake" )
+    endif()
 endif()
 
 if( NOT Protobuf_PROTOC_EXECUTABLE )
-if( NOT KICAD_USE_CMAKE_FINDPROTOBUF)
-    set( Protobuf_PROTOC_EXECUTABLE "protobuf::protoc" )
-else()
-    MESSAGE( FATAL_ERROR "Protobuf compiler not found. Please install protobuf-compiler." )
-endif()
-endif()
-
-if( NOT Protobuf_INCLUDE_DIR )
-    get_target_property( Protobuf_INCLUDE_DIR protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES )
+    if( NOT KICAD_USE_CMAKE_FINDPROTOBUF)
+        set( Protobuf_PROTOC_EXECUTABLE "protobuf::protoc" )
+    else()
+        MESSAGE( FATAL_ERROR "Protobuf compiler not found. Please install protobuf-compiler." )
+    endif()
 endif()
 
 
@@ -986,6 +1018,11 @@ message( STATUS "Python module install path: ${PYTHON_DEST}" )
 find_package( PythonLibs 3.6 REQUIRED )
 
 # pybind11 is header-only, so include the subdir
+# USE_CROSSCOMPILING is needed to avoid pybind11 trying to run a non-native intrepreter
+# It also makes no sense it needs a second flag in addition to CMAKE_CROSSCOMPILING
+set( PYBIND11_USE_CROSSCOMPILING TRUE )
+# Disable the findpython integration that pybind has buried in it
+set( PYBIND11_NOPYTHON TRUE )
 add_subdirectory(thirdparty/pybind11)
 
 # Make sure that we get our pybind11 and not the system pybind11 (ours is patched to work with wx)
@@ -999,7 +1036,7 @@ set( INC_AFTER ${INC_AFTER} ${PYTHON_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/s
 
 if( KICAD_SCRIPTING_WXPYTHON )
     # Find the wxPython installation
-    if( NOT VCPKG_TOOLCHAIN AND NOT KICAD_BUILD_ARCH_ARM64 )
+    if( NOT VCPKG_TOOLCHAIN )
         find_package( wxPython REQUIRED )
 
         if( WXPYTHON_VERSION VERSION_LESS 4.0.0 )
@@ -1057,14 +1094,14 @@ endif()
 # See line 49 of cmake/FindwxWidgets.cmake
 set( wxWidgets_CONFIG_OPTIONS ${wxWidgets_CONFIG_OPTIONS} --static=no )
 
-find_package( wxWidgets ${wxWidgets_REQ_VERSION} COMPONENTS gl aui adv html core net base propgrid xml stc richtext REQUIRED )
+find_package( wxWidgets ${wxWidgets_REQ_VERSION} COMPONENTS gl aui adv html core net base propgrid xml stc richtext webview REQUIRED )
 
 # Include wxWidgets macros.
 include( ${wxWidgets_USE_FILE} )
 
 # Detect wxWidgets port being used
 if( wxWidgets_FIND_STYLE STREQUAL "win32" )
-    string(REGEX MATCH "^[msw|qt|gtk]*" KICAD_WX_PORT "${WX_CONFIGURATION}")
+    string(REGEX MATCH "(msw|qt|gtk)" KICAD_WX_PORT "${WX_CONFIGURATION}")
 
     if( KICAD_WX_PORT STREQUAL "qt" )
         add_compile_definitions( __WXQT__ )
@@ -1072,7 +1109,7 @@ if( wxWidgets_FIND_STYLE STREQUAL "win32" )
         add_compile_definitions( __WXGTK__ )
     endif()
 elseif( _wx_selected_config )
-    string(REGEX MATCH "^[msw|qt|gtk|osx]*" KICAD_WX_PORT "${_wx_selected_config}")
+    string(REGEX MATCH "(msw|qt|gtk|osx)" KICAD_WX_PORT "${_wx_selected_config}")
 endif()
 
 if( KICAD_WX_PORT )
@@ -1097,6 +1134,18 @@ if( MINGW )
     endif()
 endif()
 
+
+message(STATUS "wxUSE_GLCANVAS_EGL=${wxWidgets_GLCANVAS_EGL}")
+message(STATUS "wxHAS_GLX=${wxWidgets_HAS_GLX}")
+message(STATUS "wxHAS_EGL=${wxWidgets_HAS_EGL}")
+
+# Find OpenGL with GLU
+find_package( OpenGL REQUIRED )
+
+if( KICAD_WAYLAND )
+    message( STATUS "Configuring KiCad to support Wayland features" )
+    add_compile_definitions( KICAD_WAYLAND )
+endif()
 if( APPLE )
     # Remove app bundles in ${KICAD_BIN} before installing anything new.
     # Must be defined before all includes so that it is executed first.
@@ -1169,6 +1218,12 @@ list( APPEND CMAKE_CTEST_ARGUMENTS "--output-on-failure" )
 # Let CMake look in these directories for nested
 # 'CMakeLists.txt' files to process
 #================================================
+
+# Desktop application identifiers, shared by resource metadata generation and the
+# runtime Wayland app_id in kicommon (must be visible before both subdirectories).
+if( UNIX AND NOT APPLE )
+    include( ${KICAD_CMAKE_MODULE_PATH}/KiCadAppNames.cmake )
+endif()
 
 # Binaries ( CMake targets )
 add_subdirectory( api )

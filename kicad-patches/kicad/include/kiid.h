@@ -59,6 +59,11 @@ public:
 
     size_t Hash() const;
 
+    /**
+     * Return a KIID derived from a name, the same name always gives the same KIID.
+     */
+    static KIID FromName( const std::string& aName );
+
     bool        IsLegacyTimestamp() const;
     timestamp_t AsLegacyTimestamp() const;
 
@@ -90,13 +95,13 @@ public:
     static void SeedGenerator( unsigned int aSeed );
 
     /**
-     * Snapshot / rewind the process-global UUID generator position (RL determinism).
+     * Snapshot / rewind this thread's thread-local UUID generator position (RL determinism).
      *
-     * ``GetGeneratorState`` returns the boost::mt19937 engine state as an opaque byte
-     * blob; ``SetGeneratorState`` restores it. Used by the RL router's checkpoint/
-     * restore so a routing action replayed after a restore mints the same UUID stream
-     * a fresh run would (the generator is otherwise seeded once and never rewound). A
-     * size mismatch / empty state is a no-op. Not for GUI/plugin use.
+     * ``GetGeneratorState`` returns this thread's boost::mt19937 engine state as an opaque byte
+     * blob; ``SetGeneratorState`` restores it. Checkpoint and restore must run on the same
+     * thread; a snapshot cannot rewind another thread's generator. The blob is only portable
+     * in-process with the same Boost/compiler ABI. Empty or size-mismatched states are a no-op.
+     * Not for GUI/plugin use.
      */
     static std::string GetGeneratorState();
     static void        SetGeneratorState( const std::string& aState );
@@ -273,6 +278,20 @@ template<> struct KICOMMON_API std::hash<KIID>
     std::size_t operator()( const KIID& aId ) const
     {
         return aId.Hash();
+    }
+};
+
+
+template<> struct std::hash<KIID_PATH>
+{
+    std::size_t operator()( const KIID_PATH& aPath ) const
+    {
+        std::size_t seed = 0;
+
+        for( const KIID& kiid : aPath )
+            seed ^= std::hash<KIID>()( kiid ) + 0x9e3779b9 + ( seed << 6 ) + ( seed >> 2 );
+
+        return seed;
     }
 };
 

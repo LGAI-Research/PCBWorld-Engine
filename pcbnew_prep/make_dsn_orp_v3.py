@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """
-Convert exacad_sorted/<folder>/processed_v9_guide_v3.kicad_pcb + .kicad_pro
-to DSN + ORP format under exacad_sorted_dsn/<folder>/.
+Convert exacad_sorted_v10/<folder>/processed_v10_guide_v3.kicad_pcb + .kicad_pro
+to DSN + ORP format under exacad_sorted_dsn_v10/<folder>/.
 
 DSN:
   - Unroute the board, then call pcbnew.ExportSpecctraDSN.
@@ -42,8 +42,8 @@ from setup_drvzero import remove_routing
 
 # ─────────────────────────────────────────────
 # Path constants (env override)
-#   PCBENCH_PCB_ROOT  — raw kicad_pcb (exacad_sorted) directory
-#   PCBENCH_DSN_ROOT  — output directory for DSN+ORP
+#   PCBENCH_PCB_ROOT  — raw kicad_pcb (exacad_sorted_v10) directory
+#   PCBENCH_DSN_ROOT  — output directory (exacad_sorted_dsn_v10) for DSN+ORP
 # Both env vars are required; no built-in machine-specific fallback so the
 # script is portable across hosts.
 # ─────────────────────────────────────────────
@@ -53,13 +53,13 @@ _DST = _os.environ.get('PCBENCH_DSN_ROOT')
 if not _SRC or not _DST:
     raise SystemExit(
         'PCBENCH_PCB_ROOT and PCBENCH_DSN_ROOT must be set (paths to the '
-        'exacad_sorted source tree and the DSN+ORP output tree).'
+        'exacad_sorted_v10 source tree and the exacad_sorted_dsn_v10 output tree).'
     )
 SRC_DIR = Path(_SRC)
 DST_DIR = Path(_DST)
 ROOT = SRC_DIR.parent  # kept for backward-compat in any downstream prints
 
-INPUT_STEM = 'processed_v9_guide_v3'
+INPUT_STEM = 'processed_v10_guide_v3'
 DSN_NAME = f'{INPUT_STEM}_unrouted.dsn'
 ORP_NAME = f'{INPUT_STEM}.orp'
 
@@ -758,9 +758,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', default=str(SRC_DIR),
-                    help='Input directory (default: exacad_sorted).')
+                    help='Input directory (default: exacad_sorted_v10).')
     ap.add_argument('--dst', default=str(DST_DIR),
-                    help='Output directory (default: exacad_sorted_dsn).')
+                    help='Output directory (default: exacad_sorted_dsn_v10).')
     ap.add_argument('--limit', type=int, default=0,
                     help='Max number of folders to process (0 = all).')
     ap.add_argument('--targets', nargs='*', default=None,

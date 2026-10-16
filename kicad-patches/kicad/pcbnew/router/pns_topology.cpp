@@ -39,8 +39,10 @@
 
 #include "pns_diff_pair.h"
 #include "pns_topology.h"
+#include "pcb_track.h"
 
 #include <board.h>
+#include <length_delay_calculation/length_delay_calculation.h>
 #include <pad.h>
 
 namespace PNS {
@@ -440,128 +442,488 @@ const ITEM_SET TOPOLOGY::AssembleTrivialPath( ITEM* aStart,
 }
 
 
+std::vector<LINE> TOPOLOGY::findLinesFromVia( ROUTER_IFACE* aRouterIface, VIA* aVia, const std::set<ITEM*>& aVisited )
+{
+    std::vector<LINE>        result;
+    NODE::OBSTACLES          obstacles;
+    COLLISION_SEARCH_OPTIONS opts;
+
+    opts.m_differentNetsOnly = false;
+    opts.m_overrideClearance = 0;
+    opts.m_kindMask = ITEM::SEGMENT_T | ITEM::ARC_T;
+
+    m_world->QueryColliding( aVia, obstacles, opts );
+
+    NET_HANDLE             net = aVia->Net();
+    std::set<LINKED_ITEM*> assembled;
+
+    const PCB_VIA* pcbVia = ( aVia->Parent() && aVia->Parent()->Type() == PCB_VIA_T )
+                                    ? static_cast<const PCB_VIA*>( aVia->Parent() )
+                                    : nullptr;
+
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "findLinesFromVia: VIA at (%d,%d), net=%p, %zu obstacles" ), aVia->Pos().x,
+                aVia->Pos().y, net, obstacles.size() );
+
+    for( const OBSTACLE& obs : obstacles )
+    {
+        if( obs.m_item->Net() != net )
+            continue;
+
+        LINKED_ITEM* linked = static_cast<LINKED_ITEM*>( obs.m_item );
+
+        if( aVisited.contains( linked ) )
+            continue;
+
+        if( assembled.contains( linked ) )
+            continue;
+
+        // Make sure at least one anchor is inside the via pad
+        VECTOR2I anchor0 = linked->Anchor( 0 );
+        VECTOR2I anchor1 = linked->Anchor( 1 );
+
+        bool anchor0Inside, anchor1Inside;
+
+        if( pcbVia )
+        {
+            PCB_LAYER_ID pcbLayer = aRouterIface->GetBoardLayerFromPNSLayer( linked->Layer() );
+            anchor0Inside = LENGTH_DELAY_CALCULATION::IsPointInsideViaPad( pcbVia, anchor0, pcbLayer );
+            anchor1Inside = LENGTH_DELAY_CALCULATION::IsPointInsideViaPad( pcbVia, anchor1, pcbLayer );
+        }
+        else
+        {
+            // Fallback to PNS shape collision
+            const SHAPE* shape = aVia->Shape( aVia->Layer() );
+            anchor0Inside = shape && shape->Collide( anchor0, 0 );
+            anchor1Inside = shape && shape->Collide( anchor1, 0 );
+        }
+
+        if( !anchor0Inside && !anchor1Inside )
+        {
+            wxLogTrace( wxT( "PNS_TUNE" ), wxT( "  skip collision: layer=%d anchor0=(%d,%d) anchor1=(%d,%d)" ),
+                        linked->Layer(), anchor0.x, anchor0.y, anchor1.x, anchor1.y );
+            continue;
+        }
+
+        LINE l = m_world->AssembleLine( linked, nullptr, false, true );
+
+        for( LINKED_ITEM* link : l.Links() )
+            assembled.insert( link );
+
+        result.push_back( l );
+    }
+
+    return result;
+}
+
+
+TOPOLOGY::WALK_RESULT TOPOLOGY::walkTuningPath( ROUTER_IFACE* aRouterIface, LINE& aStartLine, bool aStartFromBack,
+                                                const std::set<ITEM*>& aVisited )
+{
+    using clock = std::chrono::steady_clock;
+
+    WALK_RESULT best;
+
+    NET_HANDLE net = aStartLine.Net();
+    const int  timeoutMs = ADVANCED_CFG::GetCfg().m_FollowBranchTimeout;
+    auto       startTime = clock::now();
+
+    struct STATE
+    {
+        VECTOR2I        endpoint;
+        ITEM_SET        pathItems;
+        int64_t         pathLength;
+        std::set<ITEM*> visited;
+    };
+
+    std::stack<STATE> stateStack;
+
+    STATE initial;
+    initial.endpoint = aStartFromBack ? aStartLine.CLastPoint() : aStartLine.CPoint( 0 );
+    initial.pathLength = 0;
+    initial.visited = aVisited;
+    stateStack.push( std::move( initial ) );
+
+    while( !stateStack.empty() )
+    {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( clock::now() - startTime ).count();
+
+        if( elapsed > timeoutMs )
+        {
+            wxLogTrace( wxT( "PNS_TUNE" ), wxT( "walkTuningPath: timeout after %lld ms" ), elapsed );
+            break;
+        }
+
+        STATE current = std::move( stateStack.top() );
+        stateStack.pop();
+
+        ITEM_SET hits = m_world->HitTest( current.endpoint );
+
+        SOLID* pad = nullptr;
+
+        for( ITEM* item : hits )
+        {
+            if( item->OfKind( ITEM::SOLID_T ) && item->Net() == net && !current.visited.contains( item ) )
+            {
+                pad = static_cast<SOLID*>( item );
+                break;
+            }
+        }
+
+        if( pad )
+        {
+            if( current.pathLength > best.m_length )
+            {
+                best.m_length = current.pathLength;
+                best.m_items = current.pathItems;
+                best.m_endPad = pad;
+            }
+
+            // Continue through an in-line pad so tuning spans the whole net.
+            current.visited.insert( pad );
+
+            for( ITEM* item : hits )
+            {
+                if( !item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+                    continue;
+
+                if( item->Net() != net || current.visited.contains( item ) )
+                    continue;
+
+                LINE contLine = m_world->AssembleLine( static_cast<LINKED_ITEM*>( item ), nullptr, false, true );
+
+                VECTOR2I ep = current.endpoint;
+                bool     startNear = ( contLine.CPoint( 0 ) - ep ).SquaredEuclideanNorm()
+                                 <= ( contLine.CLastPoint() - ep ).SquaredEuclideanNorm();
+
+                STATE nextState;
+                nextState.endpoint = startNear ? contLine.CLastPoint() : contLine.CPoint( 0 );
+                nextState.pathItems = current.pathItems;
+                nextState.pathItems.Add( contLine );
+                nextState.pathLength = current.pathLength + contLine.CLine().Length();
+                nextState.visited = current.visited;
+
+                for( LINKED_ITEM* link : contLine.Links() )
+                    nextState.visited.insert( link );
+
+                stateStack.push( std::move( nextState ) );
+            }
+
+            continue;
+        }
+
+        VIA* via = nullptr;
+
+        for( ITEM* item : hits )
+        {
+            if( item->OfKind( ITEM::VIA_T ) && item->Net() == net && !item->IsVirtual()
+                && !current.visited.contains( item ) )
+            {
+                via = static_cast<VIA*>( item );
+                break;
+            }
+        }
+
+        if( via )
+        {
+            current.visited.insert( via );
+
+            std::vector<LINE> continuations = findLinesFromVia( aRouterIface, via, current.visited );
+
+            for( LINE& contLine : continuations )
+            {
+                VECTOR2I ep = current.endpoint;
+                bool     startNearVia = ( contLine.CPoint( 0 ) - ep ).SquaredEuclideanNorm()
+                                    <= ( contLine.CLastPoint() - ep ).SquaredEuclideanNorm();
+
+                VECTOR2I forwardEndpoint = startNearVia ? contLine.CLastPoint() : contLine.CPoint( 0 );
+
+                int64_t contLength = contLine.CLine().Length();
+
+                if( const BOARD_ITEM* parent = via->Parent(); parent && parent->Type() == PCB_VIA_T )
+                {
+                    const PCB_VIA*      pcbVia = static_cast<const PCB_VIA*>( parent );
+                    SHAPE_LINE_CHAIN    clipped = contLine.Line();
+                    const PCB_LAYER_ID  pcbLayer = aRouterIface->GetBoardLayerFromPNSLayer( contLine.Layer() );
+
+                    LENGTH_DELAY_CALCULATION::OptimiseTraceInVia( clipped, pcbVia, pcbLayer );
+                    contLength = clipped.Length();
+                }
+
+                STATE nextState;
+                nextState.endpoint = forwardEndpoint;
+                nextState.pathItems = current.pathItems;
+                nextState.pathItems.Add( via );
+                nextState.pathItems.Add( contLine );
+                nextState.pathLength = current.pathLength + contLength;
+                nextState.visited = current.visited;
+
+                for( LINKED_ITEM* link : contLine.Links() )
+                    nextState.visited.insert( link );
+
+                stateStack.push( std::move( nextState ) );
+            }
+
+            if( continuations.empty() )
+            {
+                if( current.pathLength > best.m_length )
+                {
+                    best.m_length = current.pathLength;
+                    best.m_items = current.pathItems;
+                    best.m_items.Add( via );
+                    best.m_endPad = nullptr;
+                }
+            }
+        }
+        else
+        {
+            if( current.pathLength > best.m_length )
+            {
+                best.m_length = current.pathLength;
+                best.m_items = current.pathItems;
+                best.m_endPad = nullptr;
+            }
+        }
+    }
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "walkTuningPath: completed, best length=%lld, %d items, pad=%p" ),
+                best.m_length, best.m_items.Size(), best.m_endPad );
+
+    return best;
+}
+
+
 const ITEM_SET TOPOLOGY::AssembleTuningPath( ROUTER_IFACE* aRouterIface, ITEM* aStart, SOLID** aStartPad,
                                              SOLID** aEndPad )
 {
-    std::pair<const JOINT*, const JOINT*> joints;
-    ITEM_SET initialPath = AssembleTrivialPath( aStart, &joints, true );
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "" ) );
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "########## AssembleTuningPath: START ##########" ) );
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: aStart=%p, kind=%s" ),
+                aStart, aStart->KindStr().c_str() );
+
+    LINKED_ITEM* seg = nullptr;
+
+    if( aStart->Kind() == ITEM::VIA_T )
+    {
+        VIA* via = static_cast<VIA*>( aStart );
+
+        const JOINT* jt = m_world->FindJoint( via->Pos(), via );
+
+        if( jt && jt->IsNonFanoutVia() )
+        {
+            ITEM_SET links( jt->CLinks() );
+
+            for( ITEM* item : links )
+            {
+                if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+                {
+                    seg = static_cast<LINKED_ITEM*>( item );
+                    break;
+                }
+            }
+        }
+
+        if( !seg )
+        {
+            std::vector<LINE> continuations = findLinesFromVia( aRouterIface, via, {} );
+
+            if( continuations.empty() )
+            {
+                wxLogTrace( wxT( "PNS_TUNE" ),
+                            wxT( "AssembleTuningPath: no via continuation found, returning empty" ) );
+                return ITEM_SET();
+            }
+
+            for( LINKED_ITEM* link : continuations.front().Links() )
+            {
+                if( link->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+                {
+                    seg = link;
+                    break;
+                }
+            }
+        }
+    }
+    else if( aStart->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+    {
+        seg = static_cast<LINKED_ITEM*>( aStart );
+    }
+
+    if( !seg )
+    {
+        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: no segment found, returning empty" ) );
+        return ITEM_SET();
+    }
+
+    LINE l = m_world->AssembleLine( seg, nullptr, false, true );
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: initial line %d segments, length=%lld" ), l.SegmentCount(),
+                l.CLine().Length() );
+
+    std::set<ITEM*> visited;
+
+    for( LINKED_ITEM* link : l.Links() )
+        visited.insert( link );
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: walking LEFT from (%d,%d)" ), l.CPoint( 0 ).x,
+                l.CPoint( 0 ).y );
+    WALK_RESULT left = walkTuningPath( aRouterIface, l, false, visited );
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: walking RIGHT from (%d,%d)" ), l.CLastPoint().x,
+                l.CLastPoint().y );
+    WALK_RESULT right = walkTuningPath( aRouterIface, l, true, visited );
+
+    ITEM_SET path;
+
+    for( ITEM* item : left.m_items )
+        path.Prepend( item );
+
+    path.Add( l );
+
+    for( ITEM* item : right.m_items )
+        path.Add( item );
 
     PAD* padA = nullptr;
     PAD* padB = nullptr;
 
-    auto getPadFromJoint =
-            []( const JOINT* aJoint, PAD** aTargetPad, SOLID** aTargetSolid )
-            {
-                for( ITEM* item : aJoint->LinkList() )
-                {
-                    if( item->OfKind( ITEM::SOLID_T ) )
-                    {
-                        BOARD_ITEM* bi = static_cast<SOLID*>( item )->Parent();
+    if( left.m_endPad )
+    {
+        BOARD_ITEM* bi = left.m_endPad->Parent();
 
-                        if( bi->Type() == PCB_PAD_T )
-                        {
-                            *aTargetPad = static_cast<PAD*>( bi );
+        if( bi && bi->Type() == PCB_PAD_T )
+        {
+            padA = static_cast<PAD*>( bi );
 
-                            if( aTargetSolid )
-                                *aTargetSolid = static_cast<SOLID*>( item );
-                        }
+            if( aStartPad )
+                *aStartPad = left.m_endPad;
 
-                        break;
-                    }
-                }
-            };
+            wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: found start pad" ) );
+        }
+    }
 
-    if( joints.first )
-        getPadFromJoint( joints.first, &padA, aStartPad );
+    if( right.m_endPad )
+    {
+        BOARD_ITEM* bi = right.m_endPad->Parent();
 
-    if( joints.second )
-        getPadFromJoint( joints.second, &padB, aEndPad );
+        if( bi && bi->Type() == PCB_PAD_T )
+        {
+            padB = static_cast<PAD*>( bi );
+
+            if( aEndPad )
+                *aEndPad = right.m_endPad;
+
+            wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: found end pad" ) );
+        }
+    }
 
     if( !padA && !padB )
-        return initialPath;
-
-    auto clipLineToPad =
-            []( SHAPE_LINE_CHAIN& aLine, PAD* aPad, PCB_LAYER_ID aLayer, bool aForward = true )
-            {
-                const auto& shape = aPad->GetEffectivePolygon( aLayer, ERROR_INSIDE );
-
-                int start = aForward ? 0 : aLine.PointCount() - 1;
-                int delta = aForward ? 1 : -1;
-
-                // Skip the "first" (or last) vertex, we already know it's contained in the pad
-                int clip = start;
-
-                for( int vertex = start + delta;
-                     aForward ? vertex < aLine.PointCount() : vertex >= 0;
-                     vertex += delta )
-                {
-                    SEG seg( aLine.GetPoint( vertex ), aLine.GetPoint( vertex - delta ) );
-
-                    bool containsA = shape->Contains( seg.A );
-                    bool containsB = shape->Contains( seg.B );
-
-                    if( containsA && containsB )
-                    {
-                        // Whole segment is inside: clip out this segment
-                        clip = vertex;
-                    }
-                    else if( containsB )
-                    {
-                        // Only one point inside: Find the intersection
-                        VECTOR2I loc;
-
-                        if( shape->Collide( seg, 0, nullptr, &loc ) )
-                        {
-                            aLine.Replace( vertex - delta, vertex - delta, loc );
-                        }
-                    }
-                }
-
-                if( !aForward && clip < start )
-                    aLine.Remove( clip + 1, start );
-                else if( clip > start )
-                    aLine.Remove( start, clip - 1 );
-
-                // Now connect the dots
-                aLine.Insert( aForward ? 0 : aLine.PointCount(), aPad->GetPosition() );
-            };
-
-    auto processPad = [&]( const JOINT* aJoint, PAD* aPad, int aLayer )
     {
-        for( int idx = 0; idx < initialPath.Size(); idx++ )
+        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: no pads found, returning path" ) );
+        wxLogTrace( wxT( "PNS_TUNE" ), wxT( "########## AssembleTuningPath: END ##########" ) );
+        return path;
+    }
+
+    auto processPad = [&]( PAD* aPad )
+    {
+        for( int idx = 0; idx < path.Size(); idx++ )
         {
-            if( initialPath[idx]->Kind() != ITEM::LINE_T )
+            if( path[idx]->Kind() != ITEM::LINE_T )
                 continue;
 
-            LINE*        line = static_cast<LINE*>( initialPath[idx] );
-            PCB_LAYER_ID pcbLayer = aRouterIface->GetBoardLayerFromPNSLayer( line->Layer() );
+            LINE*              line = static_cast<LINE*>( path[idx] );
+            SHAPE_LINE_CHAIN&  slc = line->Line();
+            const PCB_LAYER_ID pcbLayer = aRouterIface->GetBoardLayerFromPNSLayer( line->Layer() );
 
-            if( !aPad->FlashLayer( pcbLayer ) )
-                continue;
-
-            const std::vector<VECTOR2I>& points = line->CLine().CPoints();
-
-            if( points.front() != aJoint->Pos() && points.back() != aJoint->Pos() )
-                continue;
-
-            const auto& shape = aPad->GetEffectivePolygon( pcbLayer, ERROR_INSIDE );
-
-            SHAPE_LINE_CHAIN& slc = line->Line();
-
-            if( shape->Contains( slc.CPoint( 0 ) ) )
-                clipLineToPad( slc, aPad, pcbLayer, true );
-            else if( shape->Contains( slc.CPoint( -1 ) ) )
-                clipLineToPad( slc, aPad, pcbLayer, false );
+            LENGTH_DELAY_CALCULATION::OptimiseTraceInPad( slc, aPad, pcbLayer );
         }
     };
 
     if( padA )
-        processPad( joints.first, padA, joints.first->Layer() );
+        processPad( padA );
 
     if( padB )
-        processPad( joints.second, padB, joints.second->Layer() );
+        processPad( padB );
 
-    return initialPath;
+    std::set<PAD*> processedPads;
+
+    if( padA )
+        processedPads.insert( padA );
+
+    if( padB )
+        processedPads.insert( padB );
+
+    for( int idx = 0; idx < path.Size(); idx++ )
+    {
+        if( path[idx]->Kind() != ITEM::LINE_T )
+            continue;
+
+        LINE* line = static_cast<LINE*>( path[idx] );
+
+        for( const VECTOR2I& pt : { line->CPoint( 0 ), line->CLastPoint() } )
+        {
+            ITEM_SET hits = m_world->HitTest( pt );
+
+            for( ITEM* item : hits )
+            {
+                if( item->OfKind( ITEM::SOLID_T ) && item->Net() == line->Net() )
+                {
+                    SOLID*      solid = static_cast<SOLID*>( item );
+                    BOARD_ITEM* bi = solid->Parent();
+
+                    if( bi && bi->Type() == PCB_PAD_T )
+                    {
+                        PAD* intermediatePad = static_cast<PAD*>( bi );
+
+                        if( processedPads.find( intermediatePad ) == processedPads.end() )
+                        {
+                            wxLogTrace( wxT( "PNS_TUNE" ),
+                                        wxT( "AssembleTuningPath: processing intermediate"
+                                             " pad at (%d,%d)" ),
+                                        pt.x, pt.y );
+                            processPad( intermediatePad );
+                            processedPads.insert( intermediatePad );
+                        }
+                    }
+
+                    break;
+                }
+            }
+        }
+    }
+
+    // Clip in-VIA portions and add residual path to VIA centre.
+    for( int idx = 0; idx < path.Size(); idx++ )
+    {
+        if( path[idx]->Kind() != ITEM::VIA_T )
+            continue;
+
+        VIA*        pnsVia = static_cast<VIA*>( path[idx] );
+        BOARD_ITEM* parent = pnsVia->Parent();
+
+        if( !parent || parent->Type() != PCB_VIA_T )
+            continue;
+
+        const PCB_VIA* pcbVia = static_cast<const PCB_VIA*>( parent );
+
+        for( int delta : { -1, 1 } )
+        {
+            int j = idx + delta;
+
+            if( j < 0 || j >= path.Size() || path[j]->Kind() != ITEM::LINE_T )
+                continue;
+
+            LINE*              line = static_cast<LINE*>( path[j] );
+            SHAPE_LINE_CHAIN&  slc = line->Line();
+            const PCB_LAYER_ID pcbLayer = aRouterIface->GetBoardLayerFromPNSLayer( line->Layer() );
+
+            LENGTH_DELAY_CALCULATION::OptimiseTraceInVia( slc, pcbVia, pcbLayer );
+        }
+    }
+
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "AssembleTuningPath: final path has %d items" ), path.Size() );
+    wxLogTrace( wxT( "PNS_TUNE" ), wxT( "########## AssembleTuningPath: END ##########" ) );
+
+    return path;
 }
 
 
@@ -589,7 +951,7 @@ bool TOPOLOGY::AssembleDiffPair( ITEM* aStart, DIFF_PAIR& aPair )
     if( !coupledNet || !startItem )
         return false;
 
-    LINE lp = m_world->AssembleLine( startItem );
+    LINE lp = m_world->AssembleLine( startItem, nullptr, false, false, false );
 
     std::vector<ITEM*> pItems;
     std::vector<ITEM*> nItems;
@@ -702,7 +1064,7 @@ bool TOPOLOGY::AssembleDiffPair( ITEM* aStart, DIFF_PAIR& aPair )
     if( !coupledItem )
         return false;
 
-    LINE ln = m_world->AssembleLine( coupledItem );
+    LINE ln = m_world->AssembleLine( coupledItem, nullptr, false, false, false );
 
     if( m_world->GetRuleResolver()->DpNetPolarity( refNet ) < 0 )
         std::swap( lp, ln );
@@ -745,6 +1107,7 @@ const TOPOLOGY::CLUSTER TOPOLOGY::AssembleCluster( ITEM* aStart, int aLayer, dou
 
     BOX2I clusterBBox = aStart->Shape( aLayer )->BBox();
     int64_t initialArea = clusterBBox.GetArea();
+    std::unordered_set<ITEM*> processed;
 
     while( !pending.empty() )
     {
@@ -753,7 +1116,10 @@ const TOPOLOGY::CLUSTER TOPOLOGY::AssembleCluster( ITEM* aStart, int aLayer, dou
 
         pending.pop_front();
 
-        cluster.m_items.insert( top );
+        if( processed.find( top ) == processed.end() )
+            cluster.m_items.push_back( top );
+
+        processed.insert( top );
 
         m_world->QueryColliding( top, obstacles, opts ); // only query touching objects
 
@@ -783,10 +1149,11 @@ const TOPOLOGY::CLUSTER TOPOLOGY::AssembleCluster( ITEM* aStart, int aLayer, dou
             if( aAreaExpansionLimit > 0.0 && areaRatio > aAreaExpansionLimit )
                 break;
 
-            if( cluster.m_items.find( obs.m_item ) == cluster.m_items.end() &&
+            if( processed.find( obs.m_item ) == processed.end() &&
                 obs.m_item->Layers().Overlaps( aLayer ) && !( obs.m_item->Marker() & MK_HEAD ) )
             {
-                cluster.m_items.insert( obs.m_item );
+                processed.insert( obs.m_item );
+                cluster.m_items.push_back( obs.m_item );
                 pending.push_back( obs.m_item );
             }
         }

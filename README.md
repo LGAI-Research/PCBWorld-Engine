@@ -17,7 +17,7 @@ tree is distributed from there.
 
 | Path | What |
 |---|---|
-| [`kicad-python/`](kicad-python) | git submodule, pinned to upstream KiCad 9.0.8. Not redistributed by this repository — `git submodule update --init --recursive` fetches it from upstream |
+| [`kicad-python/`](kicad-python) | upstream helper submodule. Its nested `kicad/` gitlink is owned by that repository, so `build_rl_router.sh` fetches and checks out KiCad 10.0.7 (`69cafb907ebc09e7722a2a464b1d466fc2e3608d`) before building; no older-source fallback |
 | [`kicad-patches/kicad/`](kicad-patches/kicad) | our modified copies of the upstream KiCad files the build replaces, one full file per upstream path |
 | [`kicad-patches/rl/`](kicad-patches/rl) | our C++ sources: the headless RL router, its DRC fork, and the pybind11 module `kicad_rl_router`. GPLv3 because they link KiCad |
 | [`CHANGELOG.md`](CHANGELOG.md) | the release notes, newest first — one `## vX.Y.Z` section per published release |
@@ -49,15 +49,21 @@ switches add the headless KiCad tools that the environment's data-preparation ch
 as child processes, built from the same pinned, patched source:
 
 ```bash
-BUILD_CLI=1 BUILD_PCBNEW=1 bash build_rl_router.sh
-KICAD_RUN_FROM_BUILD_DIR=1 build_rl/kicad/kicad-cli --version                          # 9.0.8
-PYTHONPATH=build_rl/pcbnew python -c 'import pcbnew; print(pcbnew.GetBuildVersion())'   # 9.0.8
+BUILD_CLI=1 BUILD_PCBNEW=1 bash build_rl_router.sh --conda
+# Linux
+KICAD_RUN_FROM_BUILD_DIR=1 build_rl/kicad/kicad-cli --version             # 10.0.7
+# macOS
+DYLD_LIBRARY_PATH=build_rl/kicad/KiCad.app/Contents/Frameworks \
+  KICAD_RUN_FROM_BUILD_DIR=1 build_rl/kicad/KiCad.app/Contents/MacOS/kicad-cli --version  # 10.0.7
+DYLD_LIBRARY_PATH=build_rl/kicad/KiCad.app/Contents/Frameworks \
+  KICAD_RUN_FROM_BUILD_DIR=1 PYTHONPATH=build_rl/pcbnew \
+  python -c 'import pcbnew; print(pcbnew.GetBuildVersion())'            # 10.0.7
 ```
 
 | switch | ninja targets | output |
 |---|---|---|
-| `BUILD_CLI=1` | `kicad-cli` | `build_rl/kicad/kicad-cli` |
-| `BUILD_PCBNEW=1` | `pcbnew_kiface pcbnew_python_module` | `build_rl/pcbnew/_pcbnew.kiface` and, beside it, `pcbnew.py` + `_pcbnew.so` (a symlink to the kiface): `build_rl/pcbnew` on `PYTHONPATH` is the whole install, for the interpreter the build was configured with (`PYTHON_EXECUTABLE`) |
+| `BUILD_CLI=1` | `kicad-cli` | Linux: `build_rl/kicad/kicad-cli`; macOS: `build_rl/kicad/KiCad.app/Contents/MacOS/kicad-cli` |
+| `BUILD_PCBNEW=1` | `pcbnew_kiface pcbnew_python_module` | `build_rl/pcbnew/pcbnew.py` and `_pcbnew.so` (`PYTHONPATH=build_rl/pcbnew`); the module is built for `PYTHON_EXECUTABLE` |
 
 - `kicad-cli pcb …` loads `_pcbnew.kiface`, so `BUILD_CLI=1` is useful only together with
   `BUILD_PCBNEW=1`. Run from the build tree, `kicad-cli` finds the kiface (one directory up,
@@ -91,6 +97,8 @@ copy sits at `pcb_world/engine/wire.py` in the environment repository, so neithe
 program imports a module from the other; the environment's
 `tools/check_separation.py` verifies the two copies match byte for byte.
 
+The KiCad 10.0.7 source port preserves Engine wire protocol version 2, including
+the handshake, field order, constants, and RL binding API.
 The server validates `KRL_FIELDS` against the live binding at startup and sends it in
 the handshake, which the client compares against its own copy. A binding whose fields
 drifted therefore fails loudly on both sides instead of silently mis-decoding.

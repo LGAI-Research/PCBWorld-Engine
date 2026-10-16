@@ -48,9 +48,7 @@ set( OCC_LIBS_COMMON
     TKLCAF
     TKMath
     TKMesh
-    TKMeshVS
     TKOffset
-    TKOpenGl
     TKPrim
     TKRWMesh
     TKService
@@ -138,6 +136,7 @@ else(WIN32)
     HINTS
     ${OCC_LIBRARY_DIR}
     /usr
+    /usr/opencascade
     /usr/local
     /usr/local/opencascade
     /opt/opencascade
@@ -155,12 +154,9 @@ if(OCC_LIBRARY)
     )
   ENDIF()
 else(OCC_LIBRARY)
-  message( "" )
-  message( "*** OpenCascade library missing ***" )
-  message( "Verify your OpenCascade installation or pass CMake" )
-  message( "  the library directory as '-DOCC_LIBRARY_DIR=<path>'" )
-  message( "" )
-  message( FATAL_ERROR "" )
+  message( WARNING "OpenCascade library not found - STEP features unavailable" )
+  set( OCC_FOUND FALSE )
+  return()
 endif(OCC_LIBRARY)
 
 if(OCC_INCLUDE_DIR AND NOT ${OCC_INCLUDE_DIR} STREQUAL "OCC_INCLUDE_DIR-NOTFOUND")
@@ -180,7 +176,7 @@ if(OCC_INCLUDE_DIR AND NOT ${OCC_INCLUDE_DIR} STREQUAL "OCC_INCLUDE_DIR-NOTFOUND
   set(OCC_VERSION_STRING "${OCC_MAJOR}.${OCC_MINOR}.${OCC_MAINT}")
 else(OCC_INCLUDE_DIR AND NOT ${OCC_INCLUDE_DIR} STREQUAL "OCC_INCLUDE_DIR-NOTFOUND")
   message( WARNING "OpenCascade not found - STEP features unavailable" )
-  set( OCC_FOUND FALSE PARENT_SCOPE )
+  set( OCC_FOUND FALSE )
   return()
 endif(OCC_INCLUDE_DIR AND NOT ${OCC_INCLUDE_DIR} STREQUAL "OCC_INCLUDE_DIR-NOTFOUND")
 
@@ -194,13 +190,9 @@ macro(occ_lib_search SEARCH_LIST)
 #Use the specified library location if given
     find_library(OCC_TEMP_LIB ${lib} HINTS ${OCC_LIBRARY_DIR} NO_DEFAULT_PATH)
     if(${OCC_TEMP_LIB} STREQUAL "OCC_TEMP_LIB-NOTFOUND")
-      message( "" )
-      message( "*** OpenCascade library missing ***" )
-      message( "Could not find a library for ${lib} at ${OCC_LIBRARY_DIR}" )
-      message( "Verify your OpenCascade installation or pass CMake" )
-      message( "  the library directory as '-DOCC_LIBRARY_DIR=<path>'" )
-      message( "" )
-      message( FATAL_ERROR "" )
+      message( WARNING "OpenCascade library ${lib} not found - STEP features unavailable" )
+      set( OCC_FOUND FALSE )
+      return()
     else(${OCC_TEMP_LIB} STREQUAL "OCC_TEMP_LIB-NOTFOUND")
       list(APPEND OCC_LIBRARIES ${OCC_TEMP_LIB})
     endif(${OCC_TEMP_LIB} STREQUAL "OCC_TEMP_LIB-NOTFOUND")

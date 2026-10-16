@@ -37,6 +37,7 @@ class SOLID;
 class DIFF_PAIR;
 class ROUTER_IFACE;
 class LINKED_ITEM;
+class VIA;
 
 class TOPOLOGY
 {
@@ -44,20 +45,8 @@ public:
 
     struct CLUSTER
     {
-        // The single canonical item ordering (canonicalItemCompare, declared in
-        // pns_item.h) rather than the heap address, so processCluster's sequential
-        // hull-walkaround accumulation is reproducible across router instances. ASLR
-        // otherwise varies the traversal order, diverging the routed path run-to-run.
-        struct ItemCmp
-        {
-            bool operator()( const ITEM* aA, const ITEM* aB ) const
-            {
-                return canonicalItemCompare( aA, aB ) < 0;
-            }
-        };
-
-        const ITEM*                m_key = nullptr;
-        std::set<ITEM*, ItemCmp>   m_items;
+        const ITEM* m_key = nullptr;
+        std::vector<ITEM*> m_items;
     };
 
     typedef std::set<const JOINT*> JOINT_SET;
@@ -124,6 +113,25 @@ private:
 
         PATH_RESULT() : m_end( nullptr ), m_length( 0 ) {}
     };
+
+    struct WALK_RESULT
+    {
+        ITEM_SET m_items;
+        SOLID*   m_endPad;
+        int64_t  m_length;
+
+        WALK_RESULT() :
+                m_endPad( nullptr ),
+                m_length( -1 )
+        {
+        }
+    };
+
+    std::vector<LINE> findLinesFromVia( ROUTER_IFACE* aRouterIface, VIA* aVia,
+                                        const std::set<ITEM*>& aVisited );
+
+    WALK_RESULT walkTuningPath( ROUTER_IFACE* aRouterIface, LINE& aStartLine,
+                                bool aStartFromBack, const std::set<ITEM*>& aVisited );
 
     PATH_RESULT followBranch( const JOINT* aStartJoint, LINKED_ITEM* aPrev,
                               std::set<ITEM*>& aVisited, bool aFollowLockedSegments );

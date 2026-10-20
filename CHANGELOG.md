@@ -3,6 +3,26 @@
 Release notes for the PCBWorld Engine, newest first. This is a separate program from the
 PCBWorld environment, which pins one engine commit per environment release.
 
+## v1.1.0 — 2026-10-20
+
+Routing release. Wire protocol still 2. Each route now takes its sizes from the start net's class,
+so boards with more than one net class route differently from v1.0.1; single-class boards route
+identically.
+
+### Added
+- `trim_at_contact` (on `fix_route` / `finish`) and `optimize_all_lines` — opt-in copper clean-up
+  and whole-board re-optimization, off unless called
+
+### Changed
+- Route sizes per net class — `start_route` imports the start net's track width and via size
+  (KiCad `ImportSizes`, floored at board minima)
+- Size setters — `set_track_width` / `set_via_diameter` / `set_via_drill` override the open session
+  only and raise on ≤ 0; `set_via_placement(on)` replaces `toggle_via` / `reset_via_mode`
+
+### Fixed
+- Locked tracks the router splits stay locked; a failed rules load, router DRC build or restore
+  re-open raises instead of continuing silently
+
 ## v1.0.1 — 2026-09-16
 
 Build-provenance release. Router sources unchanged since v1.0.0 — no patch, CMake or

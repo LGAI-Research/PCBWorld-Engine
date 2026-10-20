@@ -15,7 +15,9 @@
 #include "pns_itemset.h"
 #include "pns_line.h"
 #include "pns_segment.h"
+#include "pns_via.h"
 #include "pns_placement_algo.h"
+#include "pns_optimizer.h"
 
 #include <board.h>
 #include <board_design_settings.h>
@@ -64,6 +66,8 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_set>
+#include <tuple>
+#include <set>
 #include <random>
 #include <chrono>
 #include <cstdint>
@@ -107,7 +111,8 @@ PNS_RL_ROUTER::PNS_RL_ROUTER( const std::string& board_path,
                               int engineSeed,
                               int shoveIterLimit,
                               int followBranchIterLimit )
-    : m_shoveIterLimit( shoveIterLimit ),
+    : m_engineSeed( engineSeed ),
+      m_shoveIterLimit( shoveIterLimit ),
       m_followBranchIterLimit( followBranchIterLimit )
 {
     // Optionally make UUID generation deterministic BEFORE loading the board, so
@@ -159,18 +164,31 @@ PNS_RL_ROUTER::PNS_RL_ROUTER( const std::string& board_path,
     if( !m_board )
         throw std::runtime_error( "PNS_RL_ROUTER: failed to load board: " + board_path );
 
-    // Bidirectional link: if the project JSON was read, BDS is overwritten
-    // from it; otherwise SetParent(..., aLoadFromFile=!LegacyLoaded)
-    // preserves whatever parseSetup() already wrote (legacy path) or takes
-    // KiCad defaults (modern pcb w/o pro file).
-    m_board->SetProject( m_project );
+    try
+    {
+        // Bidirectional link: if the project JSON was read, BDS is overwritten
+        // from it; otherwise SetParent(..., aLoadFromFile=!LegacyLoaded)
+        // preserves whatever parseSetup() already wrote (legacy path) or takes
+        // KiCad defaults (modern pcb w/o pro file).
+        m_board->SetProject( m_project );
 
-    // Net-to-netclass matching reads NET_SETTINGS.netclass_patterns; without
-    // this call all nets would fall into "Default" and per-class clearance
-    // would not apply. pcbnew does the same thing right after load.
-    m_board->SynchronizeNetsAndNetClasses( /*aResetTrackAndViaSizes=*/true );
+        // Net-to-netclass matching reads NET_SETTINGS.netclass_patterns; without
+        // this call all nets would fall into "Default" and per-class clearance
+        // would not apply. pcbnew does the same thing right after load.
+        m_board->SynchronizeNetsAndNetClasses( /*aResetTrackAndViaSizes=*/true );
 
-    initRouter();
+        initRouter();
+    }
+    catch( ... )
+    {
+        // A throwing constructor never runs the destructor: release what it would
+        // (same order — router before iface, board before the project), then rethrow.
+        m_router.reset();
+        m_iface.reset();
+        delete m_board;
+        m_board = nullptr;
+        throw;
+    }
 
     // Capture the UUID-generator position now — post board-load, post initial
     // connectivity, before any routing — so rewindKIIDToEpisodeStart() can return here
@@ -208,6 +226,30 @@ bool PNS_RL_ROUTER::wasLegacyDesignSettingsLoaded() const
 // Internal: initialise / reinitialise the PNS router
 // ---------------------------------------------------------------------------
 
+// DRC_ENGINE::InitEngine, any failure rethrown as std::runtime_error naming aWhat and the
+// cause. A swallowed failure would leave the engine without rules (initRouter: every
+// clearance query 0; runDRCEngine: a DRC on implicit rules only).
+static void initDrcEngine( DRC_ENGINE& aEngine, const wxFileName& aRules, const std::string& aWhat )
+{
+    try
+    {
+        aEngine.InitEngine( aRules );
+    }
+    catch( const IO_ERROR& ioe )   // PARSE_ERROR: not a std::exception
+    {
+        throw std::runtime_error( "PNS_RL_ROUTER: " + aWhat + ": " + ioe.What().ToStdString() );
+    }
+    catch( const std::exception& e )
+    {
+        throw std::runtime_error( "PNS_RL_ROUTER: " + aWhat + ": " + e.what() );
+    }
+    catch( ... )
+    {
+        throw std::runtime_error( "PNS_RL_ROUTER: " + aWhat + ": unknown exception" );
+    }
+}
+
+
 void PNS_RL_ROUTER::initRouter()
 {
     reseedCheckpointEpoch();   // unique handle epoch for this router instance
@@ -230,16 +272,15 @@ void PNS_RL_ROUTER::initRouter()
     m_settings->SetShoveIterationLimit( m_shoveIterLimit );
     m_settings->SetFollowBranchIterLimit( m_followBranchIterLimit );
 
-    // Defaults: walkaround mode, width from board minimum
+    // Default: walkaround mode. Track width, via size and clearance are NOT seeded
+    // here — startRoute imports them from the start item's net for every session.
     m_settings->SetMode( PNS::RM_Walkaround );
 
     BOARD_DESIGN_SETTINGS& bds = m_board->GetDesignSettings();
-    m_router->Sizes().SetTrackWidth( bds.GetCurrentTrackWidth() );
 
-    // m_MinClearance is board-level minimum; it is loaded from .kicad_pro and
-    // defaults to 0 when only a .kicad_pcb is available (as in our synthetic
-    // dataset).  The *netclass* clearance from the board file is authoritative
-    // for routing — use it when present and fall back to m_MinClearance.
+    // Reference clearance for the keepout alignment below: the board minimum
+    // (loaded from .kicad_pro; 0 when only a .kicad_pcb is available, as in our
+    // synthetic dataset), raised to the Default netclass clearance when present.
     int clearance = bds.m_MinClearance;
     if( bds.m_NetSettings )
     {
@@ -247,7 +288,6 @@ void PNS_RL_ROUTER::initRouter()
         if( defaultNC && defaultNC->HasClearance() )
             clearance = std::max( clearance, defaultNC->GetClearance() );
     }
-    m_router->Sizes().SetClearance( clearance );
 
     // Several board-level design-rule fields in BOARD_DESIGN_SETTINGS default
     // to hardcoded non-zero values when no design rules are loaded (see
@@ -288,15 +328,10 @@ void PNS_RL_ROUTER::initRouter()
     if( !bds.m_DRCEngine )
     {
         auto drcEngine = std::make_shared<DRC_ENGINE>( m_board, &bds );
-        try
-        {
-            drcEngine->InitEngine( wxFileName() );  // default rules: netclass-based
-            bds.m_DRCEngine = drcEngine;
-        }
-        catch( ... )
-        {
-            // Leave m_DRCEngine null on failure; router falls back to 0.
-        }
+        // Default rules: netclass-based. A failure raises — a null engine would route at
+        // clearance 0.
+        initDrcEngine( *drcEngine, wxFileName(), "initRouter could not build the router's DRC rules" );
+        bds.m_DRCEngine = drcEngine;
     }
 }
 
@@ -383,6 +418,12 @@ int PNS_RL_ROUTER::getShoveIterationLimit() const
 }
 
 
+int PNS_RL_ROUTER::getFollowBranchIterLimit() const
+{
+    return m_settings->FollowBranchIterLimit();
+}
+
+
 // ---------------------------------------------------------------------------
 // Checkpoint / Restore (in-memory, MCTS tree search) — full-swap baseline
 // ---------------------------------------------------------------------------
@@ -407,6 +448,7 @@ int64_t PNS_RL_ROUTER::checkpoint()
     ckpt.config.shoveIterLimit = m_settings->ShoveIterationLimit();
     ckpt.config.viaDiameter = m_router->Sizes().ViaDiameter();
     ckpt.config.viaDrill    = m_router->Sizes().ViaDrill();
+    ckpt.config.clearance   = m_router->Sizes().Clearance();
     ckpt.config.placingVia  = m_router->IsPlacingVia();
 
     // C — active routing session. Between actions a session is only open right
@@ -440,6 +482,21 @@ int64_t PNS_RL_ROUTER::checkpoint()
                  | static_cast<int64_t>( m_nextCheckpointSeq++ );
     m_checkpoints.emplace( id, std::move( ckpt ) );
     return id;
+}
+
+
+// Put the checkpoint's sizes (nm, no mm round-trip) back into the router. restore()
+// and restoreIncremental() call it again right after re-opening a session, because
+// startRoute re-imports the net class sizes and would drop a set_* override the
+// checkpointed session carried.
+static void applyCheckpointSizes( PNS::ROUTER& aRouter, const RLCheckpointConfig& aCfg )
+{
+    PNS::SIZES_SETTINGS& sz = aRouter.Sizes();
+    sz.SetTrackWidth( aCfg.trackWidth );
+    sz.SetViaDiameter( aCfg.viaDiameter );
+    sz.SetViaDrill( aCfg.viaDrill );
+    sz.SetClearance( aCfg.clearance );
+    aRouter.UpdateSizes( sz );
 }
 
 
@@ -495,14 +552,11 @@ bool PNS_RL_ROUTER::restore( int64_t handle )
     for( const std::unique_ptr<BOARD_ITEM>& stored : ckpt.tracks )
         m_board->Add( static_cast<BOARD_ITEM*>( stored->Clone() ), ADD_MODE::APPEND );
 
-    // 4. Engine config (board → config → session order). Sizes are set in
-    //    nm directly to avoid the mm round-trip of the public setters.
+    // 4. Engine config (board → config → session order).
     setRoutingMode( ckpt.config.routingMode );
     setCornerMode( ckpt.config.cornerMode );
     setShoveIterationLimit( ckpt.config.shoveIterLimit );
-    m_router->Sizes().SetTrackWidth( ckpt.config.trackWidth );
-    m_router->Sizes().SetViaDiameter( ckpt.config.viaDiameter );
-    m_router->Sizes().SetViaDrill( ckpt.config.viaDrill );
+    applyCheckpointSizes( *m_router, ckpt.config );
 
     // 5. Rebuild PNS world + connectivity from the restored board, and restore the
     //    checkpoint's DRC state (violations + signature snapshot) as a consistent
@@ -523,11 +577,17 @@ bool PNS_RL_ROUTER::restore( int64_t handle )
     //    startRoute re-derives the net from the anchor at the head position.
     if( ckpt.session.routing )
     {
-        startRoute( ckpt.session.headX_mm, ckpt.session.headY_mm,
-                    ckpt.session.headBoardLayer );
+        // Sizes and via mode only on a re-opened session (setViaPlacement throws
+        // without one); a failed re-open is reported after the KIID rewind below,
+        // so the board is fully restored either way.
+        if( startRoute( ckpt.session.headX_mm, ckpt.session.headY_mm,
+                        ckpt.session.headBoardLayer ) )
+        {
+            applyCheckpointSizes( *m_router, ckpt.config );
 
-        if( ckpt.config.placingVia && !m_router->IsPlacingVia() )
-            toggleVia();
+            if( ckpt.config.placingVia )
+                setViaPlacement( true );
+        }
     }
 
     // 7. Rewind the UUID generator to the checkpoint's position (done last, so any
@@ -535,6 +595,25 @@ bool PNS_RL_ROUTER::restore( int64_t handle )
     //    stream). New items routed after this restore now get the same UUIDs a fresh
     //    run would — the UUID obstacle tie-break is reproducible.
     KIID::SetGeneratorState( ckpt.kiidGenState );
+
+    // The session is re-opened at its head, which is its start anchor between env
+    // actions; a head moved off its net's copper (a direct caller's refused fix)
+    // re-opens on another net or none — refuse that too instead of routing it.
+    if( ckpt.session.routing
+        && ( !m_routing || getCurrentNetCode() != ckpt.session.netCode ) )
+    {
+        int reopenedNet = getCurrentNetCode();   // -1 = no session
+
+        if( m_routing )
+            cancelRoute();   // never leave a session on the wrong net behind
+
+        throw std::runtime_error( "PNS_RL_ROUTER: restore could not re-open the "
+                                  "checkpointed routing session (net "
+                                  + std::to_string( ckpt.session.netCode ) + ") at its head ("
+                                  + std::to_string( ckpt.session.headX_mm ) + ", "
+                                  + std::to_string( ckpt.session.headY_mm ) + "); re-opened net "
+                                  + std::to_string( reopenedNet ) );
+    }
 
     return true;
 }
@@ -731,9 +810,7 @@ bool PNS_RL_ROUTER::restoreIncremental( int64_t handle )
     setRoutingMode( ckpt.config.routingMode );
     setCornerMode( ckpt.config.cornerMode );
     setShoveIterationLimit( ckpt.config.shoveIterLimit );
-    m_router->Sizes().SetTrackWidth( ckpt.config.trackWidth );
-    m_router->Sizes().SetViaDiameter( ckpt.config.viaDiameter );
-    m_router->Sizes().SetViaDrill( ckpt.config.viaDrill );
+    applyCheckpointSizes( *m_router, ckpt.config );
 
     // 7. BOARD::Add/Remove already maintained the connectivity graph
     //    incrementally (board.cpp m_connectivity->Add/Remove), so recompute only
@@ -757,16 +834,41 @@ bool PNS_RL_ROUTER::restoreIncremental( int64_t handle )
     // 8. Re-open the routing session if one was active at checkpoint time.
     if( ckpt.session.routing )
     {
-        startRoute( ckpt.session.headX_mm, ckpt.session.headY_mm,
-                    ckpt.session.headBoardLayer );
+        // Sizes and via mode only on a re-opened session (setViaPlacement throws
+        // without one); a failed re-open is reported after the KIID rewind below,
+        // so the board is fully restored either way.
+        if( startRoute( ckpt.session.headX_mm, ckpt.session.headY_mm,
+                        ckpt.session.headBoardLayer ) )
+        {
+            applyCheckpointSizes( *m_router, ckpt.config );
 
-        if( ckpt.config.placingVia && !m_router->IsPlacingVia() )
-            toggleVia();
+            if( ckpt.config.placingVia )
+                setViaPlacement( true );
+        }
     }
 
     // 9. Rewind the UUID generator to the checkpoint's position (see restore() step 7):
     //    post-restore routing then mints the same UUID stream a fresh run would.
     KIID::SetGeneratorState( ckpt.kiidGenState );
+
+    // The session is re-opened at its head, which is its start anchor between env
+    // actions; a head moved off its net's copper (a direct caller's refused fix)
+    // re-opens on another net or none — refuse that too instead of routing it.
+    if( ckpt.session.routing
+        && ( !m_routing || getCurrentNetCode() != ckpt.session.netCode ) )
+    {
+        int reopenedNet = getCurrentNetCode();   // -1 = no session
+
+        if( m_routing )
+            cancelRoute();   // never leave a session on the wrong net behind
+
+        throw std::runtime_error( "PNS_RL_ROUTER: restore could not re-open the "
+                                  "checkpointed routing session (net "
+                                  + std::to_string( ckpt.session.netCode ) + ") at its head ("
+                                  + std::to_string( ckpt.session.headX_mm ) + ", "
+                                  + std::to_string( ckpt.session.headY_mm ) + "); re-opened net "
+                                  + std::to_string( reopenedNet ) );
+    }
 
     return true;
 }
@@ -788,17 +890,42 @@ void PNS_RL_ROUTER::setCornerMode( int mode )
 }
 
 
+// The three size setters override the CURRENT routing session only: startRoute
+// imports the sizes of the start item's net class for every new session. A
+// non-positive value is a caller error (there is no "reset to default" value),
+// and so is a call with no session open — the next startRoute would overwrite
+// the value without a trace.
+static int sessionSizeNm( double mm, const char* what, bool routing )
+{
+    int nm = nmFromMm( mm );
+
+    if( nm <= 0 )
+        throw std::invalid_argument( std::string( "PNS_RL_ROUTER: " ) + what
+                                     + " must be > 0 mm, got " + std::to_string( mm ) );
+
+    if( !routing )
+        throw std::runtime_error( std::string( "PNS_RL_ROUTER: " ) + what
+                                  + " can only be set while a route is in progress "
+                                    "(start_route imports the net class sizes)" );
+
+    return nm;
+}
+
+
 void PNS_RL_ROUTER::setTrackWidth( double width_mm )
 {
-    int width_nm = nmFromMm( width_mm );
+    m_router->Sizes().SetTrackWidth( sessionSizeNm( width_mm, "track width", m_routing ) );
+    // Stock ROUTER::UpdateSizes also forwards to the active placer, so a
+    // mid-session change takes effect this session.
+    m_router->UpdateSizes( m_router->Sizes() );
+}
 
-    if( width_nm > 0 )
-    {
-        m_router->Sizes().SetTrackWidth( width_nm );
-        // Stock ROUTER::UpdateSizes also forwards to the active placer, so a
-        // mid-session change takes effect this session.
-        m_router->UpdateSizes( m_router->Sizes() );
-    }
+
+std::array<double, 4> PNS_RL_ROUTER::getRouteSizes() const
+{
+    const PNS::SIZES_SETTINGS& sz = m_router->Sizes();
+    return { sz.TrackWidth() / 1e6, sz.ViaDiameter() / 1e6, sz.ViaDrill() / 1e6,
+             sz.Clearance() / 1e6 };
 }
 
 
@@ -1182,13 +1309,24 @@ bool PNS_RL_ROUTER::startRoute( double x_mm, double y_mm, int boardLayer )
     // item content (geometry-first canonical key) before every session, so the
     // routing decision depends only on the copper present — not on the order it was
     // committed, restored or loaded in. Cost: one sort + R-tree rebuild per session
-    // start (measured on the largest d3c board, ~12k items: see ENGINE.md).
+    // start (measured on the largest d3c board, ~12k items).
     m_router->GetWorld()->CanonicalizeOrder();
 
     VECTOR2I  pos( nmFromMm( x_mm ), nmFromMm( y_mm ) );
     PNS::ITEM* item = itemAt( pos, boardLayer );
 
     int pnsLayer = boardToPnsLayer( boardLayer );
+
+    // Sizes for this session come from the start item's net, through the same call
+    // pcbnew's interactive router makes when a route starts
+    // (ROUTER_TOOL::prepareInteractive): track width, via diameter / drill and
+    // clearance of the net's class, floored at the board minima. Nothing carries
+    // over from the previous session's net.
+    PNS::SIZES_SETTINGS sizes( m_router->Sizes() );
+    m_iface->SetStartLayerFromPNS( pnsLayer );
+    m_board->GetDesignSettings().m_TempOverrideTrackWidth = false;
+    m_iface->ImportSizes( sizes, item, nullptr, VECTOR2D( pos ) );
+    m_router->UpdateSizes( sizes );
 
     m_router->SetMode( PNS::PNS_MODE_ROUTE_SINGLE );
     bool ok = m_router->StartRouting( pos, item, pnsLayer );
@@ -1209,7 +1347,8 @@ bool PNS_RL_ROUTER::move( double x_mm, double y_mm )
 
 bool PNS_RL_ROUTER::fixRoute( double x_mm, double y_mm, bool forceFinish,
                              bool rejectIfStuck, int expectedLayer,
-                             double arriveTolMm, bool requireVia )
+                             double arriveTolMm, bool requireVia,
+                             bool trimAtContact )
 {
     if( !m_routing )
         return false;
@@ -1269,12 +1408,7 @@ bool PNS_RL_ROUTER::fixRoute( double x_mm, double y_mm, bool forceFinish,
         }
     }
 
-    // Gated on the CALLER's intent (``requireVia``), not on
-    // ``m_router->IsPlacingVia()``: via mode is reset only at episode reset
-    // (PCBWorld.reset -> reset_via_mode) and cancelRoute does NOT clear it, so a
-    // failed make_via leaves it on — the leak make_line already guards against
-    // with expectedLayer. Reading the router's mode here would make a later
-    // make_line fail spuriously whenever that leak is live.
+    // Gated on the CALLER's intent (``requireVia``), not on the router's via mode.
     //
     // Via intent is ALL-OR-NOTHING. LINE_PLACER attaches the pending via to the
     // head only when its own viaOk test passes (rhWalkOnly / rhShoveOnly:
@@ -1317,7 +1451,14 @@ bool PNS_RL_ROUTER::fixRoute( double x_mm, double y_mm, bool forceFinish,
 
     if( ok && forceFinish )
     {
+        // Edited on the node the commit is about to write (the placer's last node —
+        // CommitPlacement rewinds shove to exactly that locked node), so the commit
+        // carries the cleanup to the board in its own single pass.
+        if( trimAtContact )
+            trimCommitCopper( m_router->Placer()->CurrentNode( true ) );
+
         m_router->CommitRouting();
+
         m_routing = false;
         // Re-sync the PNS world from the committed board.
         resyncWorld();
@@ -1333,6 +1474,412 @@ void PNS_RL_ROUTER::cancelRoute()
     {
         m_router->StopRouting();
         m_routing = false;
+    }
+}
+
+
+int PNS_RL_ROUTER::optimizeAllLines( const std::vector<int>& netCodes, int passes )
+{
+    if( m_routing || m_dragging )
+        return -1;
+
+    if( passes < 1 )
+        return 0;
+
+    const std::set<int> nets( netCodes.begin(), netCodes.end() );
+
+    int effort = PNS::OPTIMIZER::MERGE_SEGMENTS | PNS::OPTIMIZER::MERGE_OBTUSE
+                 | PNS::OPTIMIZER::MERGE_COLINEAR | PNS::OPTIMIZER::KEEP_TOPOLOGY;
+    const auto cornerMode = m_settings->GetCornerMode();
+
+    if( m_settings->SmartPads()
+            && ( cornerMode == DIRECTION_45::MITERED_45 || cornerMode == DIRECTION_45::ROUNDED_45 ) )
+        effort |= PNS::OPTIMIZER::SMART_PADS;
+
+    int total = 0;
+
+    for( int pass = 0; pass < passes; ++pass )
+    {
+        // Pointer-keyed clearance caches alias recycled addresses after every
+        // resyncWorld (the last routing commit's, and this loop's own), and no
+        // StartRouting clears them here — same invalidation as restoreIncremental()
+        // step 1a, before the optimizer's collision checks read them.
+        m_router->GetRuleResolver()->ClearCaches();
+        m_router->GetRuleResolver()->ClearTemporaryCaches();
+
+        PNS::NODE* world = m_router->GetWorld();
+
+        if( !world )
+            break;
+
+        PNS::NODE* node = world->Branch();
+
+        // Same-net copper a line touches besides its own links (see header).
+        auto sameNetContacts =
+                [&]( const PNS::LINE& aLine, const PNS::LINE& aOwn )
+                {
+                    std::set<const PNS::ITEM*>    out;
+                    PNS::NODE::OBSTACLES          obs;
+                    PNS::COLLISION_SEARCH_OPTIONS opts;
+                    opts.m_differentNetsOnly = false;
+                    opts.m_overrideClearance = 0;       // copper contact, not clearance
+                    opts.m_filter = [&]( const PNS::ITEM* aItem )
+                    {
+                        const auto* li = dynamic_cast<const PNS::LINKED_ITEM*>( aItem );
+                        return aItem->Net() == aLine.Net() && !( li && aOwn.ContainsLink( li ) );
+                    };
+
+                    const SHAPE_LINE_CHAIN& chain = aLine.CLine();
+
+                    for( int i = 0; i < chain.SegmentCount(); ++i )
+                    {
+                        const PNS::SEGMENT seg( aLine, chain.CSegment( i ) );
+                        obs.clear();
+                        node->QueryColliding( &seg, obs, opts );
+
+                        for( const PNS::OBSTACLE& ob : obs )
+                            out.insert( ob.m_item );
+                    }
+
+                    return out;
+                };
+
+        // Board tracks in UUID order: the edit sequence must not depend on heap layout.
+        std::vector<PCB_TRACK*> tracks;
+
+        for( BOARD_ITEM* bi : m_board->Tracks() )
+        {
+            if( bi->Type() != PCB_TRACE_T )
+                continue;
+
+            auto* t = static_cast<PCB_TRACK*>( bi );
+
+            if( nets.empty() || nets.count( t->GetNetCode() ) )
+                tracks.push_back( t );
+        }
+
+        std::sort( tracks.begin(), tracks.end(),
+                   []( const PCB_TRACK* a, const PCB_TRACK* b ) { return a->m_Uuid < b->m_Uuid; } );
+
+        std::unordered_set<const PNS::ITEM*> done;
+        int replaced = 0;
+
+        for( PCB_TRACK* t : tracks )
+        {
+            // FindItemByParent searches its own node only — look it up in the world;
+            // the branch sees it until a replace overrides it (then it is in done).
+            PNS::ITEM* item = world->FindItemByParent( t );
+
+            if( !item || item->Kind() != PNS::ITEM::SEGMENT_T || done.count( item ) )
+                continue;
+
+            PNS::LINE line = node->AssembleLine( static_cast<PNS::LINKED_ITEM*>( item ) );
+            bool      locked = false;
+
+            for( const PNS::LINKED_ITEM* link : line.Links() )
+            {
+                done.insert( link );
+                locked |= link->IsLocked();
+            }
+
+            if( locked || line.SegmentCount() < 2 )
+                continue;
+
+            PNS::LINE opt( line );
+            opt.ClearLinks();
+
+            // Optimize() can report a change that leaves the geometry as it was
+            // (e.g. a Smart Pads re-evaluation); replacing it would only churn a
+            // commit per pass and keep the pass loop from converging. CompareGeometry
+            // simplifies both sides, so a result that only drops vertices on a
+            // straight run counts as unchanged too — the track cleaner merges those.
+            if( !PNS::OPTIMIZER::Optimize( &opt, effort, node )
+                    || opt.CLine().CompareGeometry( line.CLine() ) )
+                continue;
+
+            if( sameNetContacts( opt, line ) != sameNetContacts( line, line ) )
+                continue;
+
+            node->Replace( line, opt );
+            ++replaced;
+        }
+
+        if( !replaced )
+        {
+            world->KillChildren();
+            break;
+        }
+
+        // A reshaped line can come to run along same-net copper it already touched
+        // (the contact check only rejects NEW contacts): clean the committed copper
+        // exactly as trim_at_contact does, before the commit writes it.
+        trimCommitCopper( node );
+        m_router->CommitRouting( node );
+
+        resyncWorld();
+        total += replaced;
+    }
+
+    return total;
+}
+
+
+void PNS_RL_ROUTER::trimCommitCopper( PNS::NODE* aNode )
+{
+    // The copper this commit writes: the node's own items, i.e. exactly what
+    // ROUTER::CommitRouting hands the board — the route itself and whatever shove
+    // moved. Every net it touches is cleaned, not just the routed one: shove rewrites
+    // other nets' lines and can leave them overlapping their own untouched copper.
+    PNS::NODE::ITEM_VECTOR removed, added;
+    aNode->GetUpdatedItems( removed, added );
+
+    std::vector<PNS::SEGMENT*> changedSegs;
+    std::vector<PNS::VIA*>     changedVias;
+
+    for( PNS::ITEM* item : added )
+    {
+        if( item->IsVirtual() )
+            continue;
+
+        if( item->Kind() == PNS::ITEM::SEGMENT_T )
+            changedSegs.push_back( static_cast<PNS::SEGMENT*>( item ) );
+        else if( item->Kind() == PNS::ITEM::VIA_T )
+            changedVias.push_back( static_cast<PNS::VIA*>( item ) );
+    }
+
+    if( changedSegs.empty() && changedVias.empty() )
+        return;
+
+    // Geometric slack for "on the same line / at the same point". PNS rounds 45°
+    // diagonals to the nm grid, so copper that should coincide can sit 1 nm off
+    // (e.g. dx 347158 vs dy 347157): exact tests would miss those overlaps, and a
+    // crossing test on such a near-collinear pair yields 1 nm fragments. Far below
+    // any track width. 10 rather than SEG::ApproxCollinear's default of 1: every
+    // offset seen on a real board was 1 nm, and 10 is a margin over that — not a
+    // measured bound — still four orders of magnitude under the narrowest track.
+    constexpr int kSlack = 10;   // nm
+
+    // Canonical order: the edit sequence must not depend on heap layout.
+    std::sort( changedSegs.begin(), changedSegs.end(),
+               []( const PNS::ITEM* a, const PNS::ITEM* b )
+               { return PNS::canonicalItemCompare( a, b ) < 0; } );
+
+    // Same-net segments whose copper touches aProbe (clearance 0 = contact), in the
+    // canonical order the OBSTACLES set keeps.
+    auto sameNetSegs =
+            [&]( const PNS::ITEM& aProbe )
+            {
+                PNS::NODE::OBSTACLES          obs;
+                PNS::COLLISION_SEARCH_OPTIONS opts;
+                opts.m_differentNetsOnly = false;
+                opts.m_overrideClearance = 0;
+                opts.m_useClearanceEpsilon = false;
+                opts.m_kindMask = PNS::ITEM::SEGMENT_T;
+                opts.m_filter = [&]( const PNS::ITEM* aItem )
+                {
+                    return aItem != &aProbe && aItem->Net() == aProbe.Net();
+                };
+
+                aNode->QueryColliding( &aProbe, obs, opts );
+
+                std::vector<PNS::SEGMENT*> out;
+
+                for( const PNS::OBSTACLE& ob : obs )
+                    out.push_back( static_cast<PNS::SEGMENT*>( ob.m_item ) );
+
+                return out;
+            };
+
+    auto addSeg =
+            [&]( const PNS::SEGMENT& aProto, const VECTOR2I& aA, const VECTOR2I& aB )
+            {
+                std::unique_ptr<PNS::SEGMENT> s = PNS::Clone( aProto );
+                s->SetEnds( aA, aB );
+                PNS::SEGMENT* raw = s.get();
+                aNode->Add( std::move( s ), /*aAllowRedundant=*/true );
+                return raw;
+            };
+
+    // 1. Drop the stretches of each changed segment that run collinearly on other
+    //    same-net copper of at least its width: that copper already carries the
+    //    connection. Remainders are re-added; every boundary is an endpoint of one of
+    //    the two segments, so no coordinate is rounded. Zero-length segments go.
+    std::vector<PNS::SEGMENT*> kept;
+
+    for( PNS::SEGMENT* s : changedSegs )
+    {
+        const SEG         sg = s->Seg();
+        const VECTOR2I    d = sg.B - sg.A;
+        const SEG::ecoord len2 = d.SquaredEuclideanNorm();
+
+        if( len2 == 0 )
+        {
+            aNode->Remove( s );
+            continue;
+        }
+
+        std::vector<std::pair<SEG::ecoord, SEG::ecoord>> spans;
+        std::map<SEG::ecoord, VECTOR2I>                   pointAt = { { 0, sg.A }, { len2, sg.B } };
+
+        for( PNS::SEGMENT* t : sameNetSegs( *s ) )
+        {
+            if( t->Layer() != s->Layer() || t->Width() < s->Width() )
+                continue;
+
+            const SEG og = t->Seg();
+
+            if( !sg.ApproxCollinear( og, kSlack ) )
+                continue;
+
+            SEG::ecoord pa = ( og.A - sg.A ).Dot( d );
+            SEG::ecoord pb = ( og.B - sg.A ).Dot( d );
+            VECTOR2I    qa = og.A, qb = og.B;
+
+            if( pa > pb )
+            {
+                std::swap( pa, pb );
+                std::swap( qa, qb );
+            }
+
+            const SEG::ecoord lo = std::max<SEG::ecoord>( pa, 0 );
+            const SEG::ecoord hi = std::min<SEG::ecoord>( pb, len2 );
+
+            if( hi <= lo )
+                continue;
+
+            if( lo > 0 )
+                pointAt[lo] = qa;
+
+            if( hi < len2 )
+                pointAt[hi] = qb;
+
+            spans.emplace_back( lo, hi );
+        }
+
+        if( spans.empty() )
+        {
+            kept.push_back( s );
+            continue;
+        }
+
+        std::sort( spans.begin(), spans.end() );
+
+        std::vector<std::pair<SEG::ecoord, SEG::ecoord>> gaps;
+        SEG::ecoord                                       cursor = 0;
+
+        for( const auto& [lo, hi] : spans )
+        {
+            if( lo > cursor )
+                gaps.emplace_back( cursor, lo );
+
+            cursor = std::max( cursor, hi );
+        }
+
+        if( cursor < len2 )
+            gaps.emplace_back( cursor, len2 );
+
+        const std::unique_ptr<PNS::SEGMENT> proto = PNS::Clone( *s );
+        aNode->Remove( s );
+
+        // A gap no longer than the slack is rounding (an overlapping track ending a nm
+        // short of s's end), not copper to keep: re-adding it would commit the very
+        // nm-long fragment the slack exists to avoid. Projections scale by |d|.
+        const double slackSpan = kSlack * std::sqrt( static_cast<double>( len2 ) );
+
+        for( const auto& [lo, hi] : gaps )
+        {
+            if( hi - lo > slackSpan )
+                kept.push_back( addSeg( *proto, pointAt.at( lo ), pointAt.at( hi ) ) );
+        }
+    }
+
+    // 2. Joint points: every kept segment end, every via this commit placed, and every
+    //    point where a kept segment crosses same-net copper. KiCad connectivity joins
+    //    copper by overlap, but the track cleaner's dangling test is anchor-based — a
+    //    T or X junction without a joint lets it strip a dead-end chain and the
+    //    connection that ran through it. Split at each point so it is a real joint.
+    struct SPLIT
+    {
+        VECTOR2I             pos;
+        int                  netCode;
+        PNS::NET_HANDLE      net;
+        PNS_LAYER_RANGE      layers;
+    };
+
+    std::vector<SPLIT> splits;
+
+    for( PNS::SEGMENT* k : kept )
+    {
+        const SEG ks = k->Seg();
+        const int code = m_iface->GetNetCode( k->Net() );
+
+        splits.push_back( { ks.A, code, k->Net(), k->Layers() } );
+        splits.push_back( { ks.B, code, k->Net(), k->Layers() } );
+
+        for( PNS::SEGMENT* t : sameNetSegs( *k ) )
+        {
+            if( t->Layer() != k->Layer() )
+                continue;
+
+            const SEG ts = t->Seg();
+
+            // Near-collinear pairs are overlaps (step 1), not crossings.
+            if( ks.ApproxCollinear( ts, kSlack ) )
+                continue;
+
+            OPT_VECTOR2I x = ks.Intersect( ts );
+
+            if( !x )
+                continue;
+
+            // A crossing within the slack of an endpoint is that endpoint (the
+            // rounded intersection would otherwise cut a 1 nm stub).
+            for( const VECTOR2I& end : { ks.A, ks.B, ts.A, ts.B } )
+            {
+                if( ( *x - end ).EuclideanNorm() <= kSlack )
+                {
+                    *x = end;
+                    break;
+                }
+            }
+
+            splits.push_back( { *x, code, k->Net(), k->Layers() } );
+        }
+    }
+
+    for( PNS::VIA* v : changedVias )
+        splits.push_back( { v->Pos(), m_iface->GetNetCode( v->Net() ), v->Net(), v->Layers() } );
+
+    std::sort( splits.begin(), splits.end(),
+               []( const SPLIT& a, const SPLIT& b )
+               {
+                   return std::tie( a.netCode, a.pos.x, a.pos.y )
+                          < std::tie( b.netCode, b.pos.x, b.pos.y );
+               } );
+
+    for( const SPLIT& sp : splits )
+    {
+        // A dot of radius kSlack at the split point finds the segments running through it.
+        PNS::SEGMENT probe( SEG( sp.pos, sp.pos ), sp.net );
+        probe.SetWidth( 2 * kSlack );
+        probe.SetLayers( sp.layers );
+
+        for( PNS::SEGMENT* t : sameNetSegs( probe ) )
+        {
+            const SEG ts = t->Seg();
+
+            if( ( sp.pos - ts.A ).EuclideanNorm() <= kSlack
+                    || ( sp.pos - ts.B ).EuclideanNorm() <= kSlack
+                    || ts.Distance( sp.pos ) > kSlack )
+                continue;
+
+            // LINE_PLACER::SplitAdjacentSegments, minus its "a joint already sits
+            // here" early-out: the committed route's own end is exactly such a joint.
+            const std::unique_ptr<PNS::SEGMENT> proto = PNS::Clone( *t );
+            aNode->Remove( t );
+            addSeg( *proto, ts.A, sp.pos );
+            addSeg( *proto, sp.pos, ts.B );
+        }
     }
 }
 
@@ -1464,11 +2011,15 @@ void PNS_RL_ROUTER::runDRCEngine( const std::string& rules_path,
 
     try
     {
-        engine->InitEngine( wxFileName( wxString::FromUTF8( rules_path ) ) );
+        initDrcEngine( *engine, wxFileName( wxString::FromUTF8( rules_path ) ),
+                       "DRC could not load the rules '" + rules_path + "'" );
     }
     catch( ... )
     {
-        // Best effort: board default rules only
+        // m_drcViolations is already cleared: drop the incremental baseline with it,
+        // or the next incremental DRC would diff against a stale snapshot.
+        clearDRCCache();
+        throw;
     }
 
     engine->SetProgressReporter( nullptr );
@@ -1721,6 +2272,19 @@ void PNS_RL_ROUTER::setDesignRules( const RLDesignRules& rules )
 {
     BOARD_DESIGN_SETTINGS& bds = m_board->GetDesignSettings();
 
+    // A zero Default net class routing size is no rule — the router would draw zero-width
+    // copper or route at zero clearance from it. Checked before anything is changed. The
+    // microvia sizes are not checked: the router never places a microvia.
+    const RLNetClassInfo& dnc = rules.default_netclass;
+
+    for( double mm : { dnc.clearance_mm, dnc.track_width_mm, dnc.via_diameter_mm,
+                       dnc.via_drill_mm } )
+    {
+        if( mm >= 0.0 && nmFromMm( mm ) == 0 )
+            throw std::runtime_error( "PNS_RL_ROUTER: setDesignRules: a Default net class "
+                                      "size of 0 mm (a negative value leaves it unchanged)" );
+    }
+
     // Negative sentinel = "leave unchanged" so partial updates are easy.
     auto apply = [&]( double mm, int& field )
     {
@@ -1738,11 +2302,77 @@ void PNS_RL_ROUTER::setDesignRules( const RLDesignRules& rules )
     apply( rules.min_uvia_drill_mm,        bds.m_MicroViasMinDrill );
     apply( rules.copper_edge_clearance_mm, bds.m_CopperEdgeClearance );
 
-    // Resync PNS size cache — initRouter() copies these once at construction,
-    // so without this the router keeps the old values until the next reload.
-    m_router->Sizes().SetTrackWidth( bds.GetCurrentTrackWidth() );
-    m_router->Sizes().SetClearance( bds.m_MinClearance );
-    m_router->UpdateSizes( m_router->Sizes() );   // see setTrackWidth
+    // Default net class sizes, same sentinel (the YAML DRC fallback raises a pro-less
+    // board's built-in Default class to the substituted minima). Only a real change
+    // touches the class: a get_design_rules() -> set_design_rules() round trip carries
+    // the class's own values back.
+    bool defaultClassChanged = false;
+
+    if( bds.m_NetSettings )
+    {
+        if( std::shared_ptr<NETCLASS> def = bds.m_NetSettings->GetDefaultNetclass() )
+        {
+            auto applyNc = [&]( double mm, std::optional<int> current, auto setter )
+            {
+                if( mm < 0.0 )
+                    return;
+
+                int nm = nmFromMm( mm );
+
+                if( !current || *current != nm )
+                {
+                    setter( nm );
+                    defaultClassChanged = true;
+                }
+            };
+
+            const RLNetClassInfo& nc = rules.default_netclass;
+            applyNc( nc.clearance_mm, def->GetClearanceOpt(),
+                     [&]( int v ) { def->SetClearance( v ); } );
+            applyNc( nc.track_width_mm, def->GetTrackWidthOpt(),
+                     [&]( int v ) { def->SetTrackWidth( v ); } );
+            applyNc( nc.via_diameter_mm, def->GetViaDiameterOpt(),
+                     [&]( int v ) { def->SetViaDiameter( v ); } );
+            applyNc( nc.via_drill_mm, def->GetViaDrillOpt(),
+                     [&]( int v ) { def->SetViaDrill( v ); } );
+            applyNc( nc.uvia_diameter_mm, def->GetuViaDiameterOpt(),
+                     [&]( int v ) { def->SetuViaDiameter( v ); } );
+            applyNc( nc.uvia_drill_mm, def->GetuViaDrillOpt(),
+                     [&]( int v ) { def->SetuViaDrill( v ); } );
+        }
+    }
+
+    if( defaultClassChanged )
+    {
+        // Every place that copied the class values at load time must see the new
+        // ones: the nets' effective (composite) classes, which fill unset fields
+        // from Default (SynchronizeNetsAndNetClasses clears and rebuilds them, as
+        // at load), and the router's DRC engine, whose implicit net class rules —
+        // what ImportSizes and the clearance resolver query — are compiled from the
+        // class values at InitEngine (initRouter builds it the same way).
+        m_board->SynchronizeNetsAndNetClasses( /*aResetTrackAndViaSizes=*/true );
+        m_router->GetRuleResolver()->ClearCaches();
+
+        if( bds.m_DRCEngine )
+        {
+            try
+            {
+                initDrcEngine( *bds.m_DRCEngine, wxFileName(),
+                               "setDesignRules could not rebuild the router's DRC rules "
+                               "after the Default net class change" );
+            }
+            catch( ... )
+            {
+                // The class is already changed: drop the DRC baseline too, then fail
+                // loudly — the router would otherwise size routes from stale rules.
+                clearDRCCache();
+                throw;
+            }
+        }
+    }
+
+    // No size resync here: startRoute imports the sizes for every session and
+    // reads these minima and the class values then.
 
     // Rule change invalidates the incremental-DRC baseline: retained violations
     // were computed under the OLD rules and must not be mixed with a scoped
@@ -2650,7 +3280,7 @@ std::string PNS_RL_ROUTER::getFailureReason() const
 // Routing Control
 // ---------------------------------------------------------------------------
 
-bool PNS_RL_ROUTER::finish( int maxAttempts )
+bool PNS_RL_ROUTER::finish( int maxAttempts, bool trimAtContact )
 {
     if( !m_routing )
         return false;
@@ -2661,6 +3291,12 @@ bool PNS_RL_ROUTER::finish( int maxAttempts )
 
     if( ok )
     {
+        // Same pre-commit cleanup as fixRoute, on the same node: Finish() fixed the
+        // route with its end item, which joins only the end — the walkaround before
+        // it can still run along same-net copper.
+        if( trimAtContact )
+            trimCommitCopper( m_router->Placer()->CurrentNode( true ) );
+
         m_router->CommitRouting();
         m_routing = false;
         // Re-sync the PNS world from the committed board.
@@ -2692,9 +3328,17 @@ void PNS_RL_ROUTER::flipPosture()
 // Via & Layer Control
 // ---------------------------------------------------------------------------
 
-void PNS_RL_ROUTER::toggleVia()
+void PNS_RL_ROUTER::setViaPlacement( bool on )
 {
+    if( m_router->IsPlacingVia() == on )
+        return;
+
+    // PNS only exposes a toggle, and it acts only while a route is in progress.
     m_router->ToggleViaPlacement();
+
+    if( m_router->IsPlacingVia() != on )
+        throw std::runtime_error( "PNS_RL_ROUTER: via placement can only be "
+                                  "changed while a route is in progress" );
 }
 
 
@@ -2726,32 +3370,15 @@ int PNS_RL_ROUTER::getCurrentLayer() const
 
 void PNS_RL_ROUTER::setViaDiameter( double diameter_mm )
 {
-    int diameter_nm = nmFromMm( diameter_mm );
-
-    if( diameter_nm > 0 )
-    {
-        m_router->Sizes().SetViaDiameter( diameter_nm );
-        m_router->UpdateSizes( m_router->Sizes() );   // see setTrackWidth
-    }
+    m_router->Sizes().SetViaDiameter( sessionSizeNm( diameter_mm, "via diameter", m_routing ) );
+    m_router->UpdateSizes( m_router->Sizes() );   // see setTrackWidth
 }
 
 
 void PNS_RL_ROUTER::setViaDrill( double drill_mm )
 {
-    int drill_nm = nmFromMm( drill_mm );
-
-    if( drill_nm > 0 )
-    {
-        m_router->Sizes().SetViaDrill( drill_nm );
-        m_router->UpdateSizes( m_router->Sizes() );   // see setTrackWidth
-    }
-}
-
-
-void PNS_RL_ROUTER::resetViaMode()
-{
-    if( m_router->IsPlacingVia() )
-        m_router->ToggleViaPlacement();
+    m_router->Sizes().SetViaDrill( sessionSizeNm( drill_mm, "via drill", m_routing ) );
+    m_router->UpdateSizes( m_router->Sizes() );   // see setTrackWidth
 }
 
 

@@ -37,6 +37,7 @@ namespace PNS
 class ROUTER;
 class ROUTING_SETTINGS;
 class ITEM;
+class NODE;
 }
 
 class PNS_RL_IFACE;
@@ -302,13 +303,15 @@ struct RLGraphicShape
  */
 struct RLNetClassInfo
 {
-    std::string name;               ///< netclass name (e.g. "Default", "phat")
-    double      clearance_mm;       ///< min copper clearance for this class
-    double      track_width_mm;     ///< default track width for this class
-    double      via_diameter_mm;    ///< default via outer diameter
-    double      via_drill_mm;       ///< default via drill diameter
-    double      uvia_diameter_mm;   ///< default microvia outer diameter
-    double      uvia_drill_mm;      ///< default microvia drill diameter
+    // -1 = unset (KiCad "inherit"); also the "leave unchanged" sentinel when a
+    // default-constructed struct reaches setDesignRules() as default_netclass.
+    std::string name;                       ///< netclass name (e.g. "Default", "phat")
+    double      clearance_mm     = -1.0;    ///< min copper clearance for this class
+    double      track_width_mm   = -1.0;    ///< default track width for this class
+    double      via_diameter_mm  = -1.0;    ///< default via outer diameter
+    double      via_drill_mm     = -1.0;    ///< default via drill diameter
+    double      uvia_diameter_mm = -1.0;    ///< default microvia outer diameter
+    double      uvia_drill_mm    = -1.0;    ///< default microvia drill diameter
 };
 
 
@@ -320,10 +323,9 @@ struct RLNetClassInfo
  *   - Track width / via size preset lists (custom widths the user can select)
  *   - Default netclass + any additional netclasses
  *
- * setDesignRules() only writes the **global minima** fields; preset lists
- * and netclass entries are ignored by the setter (treated as read-only).
- * This matches the common RL/LLM use case of tuning DRC thresholds without
- * reshaping the netclass hierarchy.
+ * setDesignRules() writes the **global minima** fields and the size fields of
+ * **default_netclass** (into the board's Default class; negative = leave
+ * unchanged, 0 throws); preset lists and the other netclass entries are read-only.
  */
 struct RLDesignRules
 {
@@ -347,8 +349,8 @@ struct RLDesignRules
     /// index 0 excluded for the same reason).
     std::vector<std::pair<double, double>> via_presets_mm;
 
-    // ------------------ Netclasses (read-only) ------------------------
-    RLNetClassInfo              default_netclass;   ///< always present
+    // ------------------ Netclasses -----------------------------------
+    RLNetClassInfo              default_netclass;   ///< always present; sizes writable
     std::vector<RLNetClassInfo> netclasses;         ///< non-Default classes
 };
 
@@ -366,6 +368,7 @@ struct RLCheckpointConfig
     int  trackWidth;     ///< m_router->Sizes().TrackWidth()  (nm)
     int  viaDiameter;    ///< m_router->Sizes().ViaDiameter() (nm)
     int  viaDrill;       ///< m_router->Sizes().ViaDrill()    (nm)
+    int  clearance;      ///< m_router->Sizes().Clearance()   (nm)
     int  shoveIterLimit; ///< m_settings->ShoveIterationLimit() — runtime-mutable,
                          ///<   so it must travel with the checkpoint
     bool placingVia;     ///< m_router->IsPlacingVia()
@@ -434,7 +437,7 @@ public:
      *        the PNS obstacle ordering, so a fixed seed makes routing — and
      *        UUID-keyed DRC — reproducible across runs/processes for a fixed action
      *        sequence. Decided once here and never re-seeded (re-seeding mid-run
-     *        would replay the same UUID stream and risk collisions). -1 = default
+     *        would replay the same UUID stream and risk collisions). < 0 = default
      *        entropy seeding (non-reproducible across processes). Global, not
      *        per-router: with multiple engines per process, the last seed wins.
      */
@@ -473,10 +476,15 @@ public:
     void setCornerMode( int mode );
 
     /**
-     * Set the track width for new segments (millimetres).
-     * Pass 0 to let PNS pick the width from design rules.
+     * Override the track width (mm, > 0) of the CURRENT routing session; the
+     * next startRoute re-imports the net class width. Throws on <= 0 and when
+     * no route is in progress.
      */
     void setTrackWidth( double width_mm );
+
+    /// {track width, via diameter, via drill, clearance} in mm the router currently
+    /// holds — set by startRoute from the start item's net class.
+    std::array<double, 4> getRouteSizes() const;
 
     // ------------------------------------------------------------------
     // Board manipulation
@@ -604,10 +612,17 @@ public:
      *                     internally (LINE_PLACER compares against head width / 2),
      *                     where copper of the placed item still covers the target.
      */
+    /**
+     * @param trimAtContact  just before the commit, clean the copper it writes on every
+     *                     touched net (see trimCommitCopper): no same-net
+     *                     overlap, and T/X junctions and vias become joints. The
+     *                     route itself is not recomputed; vias are never removed.
+     */
     bool fixRoute( double x_mm, double y_mm, bool forceFinish = true,
                    bool rejectIfStuck = false, int expectedLayer = -1,
                    double arriveTolMm = 0.0,
-                   bool requireVia = false );
+                   bool requireVia = false,
+                   bool trimAtContact = false );
 
     /**
      * Abort the current route without modifying the board.
@@ -686,10 +701,11 @@ public:
     RLDesignRules getDesignRules() const;
 
     /**
-     * Apply the **global minima** fields of @a rules to BOARD_DESIGN_SETTINGS
-     * and resync the PNS router's size cache so subsequent routing honours
-     * the new thresholds. Preset lists and netclass entries inside @a rules
-     * are ignored (they remain read-only at this layer).
+     * Apply the **global minima** fields of @a rules to BOARD_DESIGN_SETTINGS and
+     * the size fields of @a rules.default_netclass to the board's Default net
+     * class; a Default class change re-syncs the nets' classes and the router's
+     * DRC rules so the next startRoute imports the new values. Preset lists and
+     * the other netclass entries are ignored (read-only at this layer).
      *
      * Negative values are treated as "leave unchanged" to let callers update
      * a subset of fields without reading back the full struct first.
@@ -880,8 +896,13 @@ public:
      * iterations it may spend reaching the anchor; deterministic modes converge
      * and stop early regardless. Commits and resyncs on success. Returns true
      * on success.
+     *
+     * @param trimAtContact  same pre-commit cleanup as fixRoute's (see
+     *                     trimCommitCopper): ROUTER::Finish joins the route's end
+     *                     through its end item, but the stretch before it can
+     *                     still run along same-net copper.
      */
-    bool finish( int maxAttempts = 5 );
+    bool finish( int maxAttempts = 5, bool trimAtContact = false );
 
     /**
      * Undo the last fixed segment and return to the previous waypoint.
@@ -896,8 +917,9 @@ public:
     // Via & Layer Control
     // ------------------------------------------------------------------
 
-    /** Toggle via placement mode. Next fix will insert a via. */
-    void toggleVia();
+    /** Turn via placement on or off (on: the next fix ends with a via). Only
+     *  changeable while a route is in progress; throws otherwise. */
+    void setViaPlacement( bool on );
 
     /** Switch routing layer (inserts via automatically). */
     bool switchLayer( int layer );
@@ -905,16 +927,13 @@ public:
     /** True if via placement mode is active. */
     bool isPlacingVia() const;
 
-    /** Reset via placement mode to OFF. */
-    void resetViaMode();
-
     /** Current routing layer ID (F.Cu=0, B.Cu=2). */
     int getCurrentLayer() const;
 
-    /** Set via outer diameter in millimetres. */
+    /** Override the via diameter (mm) of the current session — see setTrackWidth. */
     void setViaDiameter( double diameter_mm );
 
-    /** Set via drill diameter in millimetres. */
+    /** Override the via drill (mm) of the current session — see setTrackWidth. */
     void setViaDrill( double drill_mm );
 
     // ------------------------------------------------------------------
@@ -1014,11 +1033,47 @@ public:
     void setShoveIterationLimit( int limit );
     int  getShoveIterationLimit() const;
 
+    /** Readback of the construction knobs: the engine_seed passed to the constructor
+     *  (< 0 = entropy seeding) and the followBranch bound the PNS settings hold. */
+    int  getEngineSeed() const { return m_engineSeed; }
+    int  getFollowBranchIterLimit() const;
+
 private:
     void initRouter();
     int boardToPnsLayer( int boardLayer ) const;
     int pnsToBoardLayer( int pnsLayer ) const;
     PNS::ITEM* itemAt( const VECTOR2I& pos, int boardLayer );
+
+    /// Pre-commit copper cleanup on @a aNode, the node about to be committed, over
+    /// every net its own items touch (the route and whatever shove moved): drop the
+    /// stretches of those segments that lie collinearly on other same-net copper of at
+    /// least their width, then split same-net segments at every kept segment end, new
+    /// via and same-net crossing, so each junction is a joint.
+    void trimCommitCopper( PNS::NODE* aNode );
+
+public:
+    /**
+     * Final whole-board line optimization — the router's per-head optimizer applied
+     * to every committed line (joint to joint), like the track cleaner a finishing
+     * pass rather than a routing step. QUIESCENT ONLY: returns -1 while a routing
+     * or drag session is open.
+     *
+     * Each pass assembles every line of the selected nets (@a netCodes, empty = all),
+     * runs the PNS OPTIMIZER (merge segments/obtuse/colinear, topology kept, Smart
+     * Pads in 45° modes; collisions checked) and commits the replacements. A result
+     * touching same-net copper the original line did not — KEEP_TOPOLOGY lets a
+     * shortcut run over a same-net pad — is rejected, so connectivity is unchanged.
+     * A result whose shape equals the original's is not a replacement either: that
+     * includes one that only drops vertices on a straight run, which are left to
+     * the track cleaner's collinear merge.
+     * The copper to commit first gets the trim_at_contact cleanup (trimCommitCopper)
+     * — a reshaped line may run along same-net copper it already touched. Runs up
+     * to @a passes passes (none when < 1), stopping early when a pass replaces
+     * nothing. Returns the lines replaced in total.
+     */
+    int optimizeAllLines( const std::vector<int>& netCodes, int passes = 2 );
+
+private:
 
     // Declaration order matters for destruction: SETTINGS_MANAGER (declared
     // first) is destroyed LAST so it outlives m_board, which holds a raw
@@ -1038,6 +1093,7 @@ private:
     std::unique_ptr<PNS_RL_IFACE>         m_iface;
     std::unique_ptr<PNS::ROUTER>          m_router;
     std::unique_ptr<PNS::ROUTING_SETTINGS> m_settings;
+    int                                   m_engineSeed = -1;             // as passed to the ctor (readback)
     int                                   m_shoveIterLimit = 250;        // applied in initRouter()
     int                                   m_followBranchIterLimit = 1000000;
     bool                                  m_routing  = false;

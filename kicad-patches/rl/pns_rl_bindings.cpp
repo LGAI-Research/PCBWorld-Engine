@@ -407,8 +407,9 @@ PYBIND11_MODULE( kicad_rl_router, m )
     // RLDesignRules
     // ------------------------------------------------------------------
     // Round-trip struct for get_design_rules / set_design_rules.
-    // Only the `min_*` + `copper_edge_clearance_mm` fields are written by the
-    // setter; preset lists and netclass entries are read-only snapshots.
+    // The setter writes the `min_*` + `copper_edge_clearance_mm` fields and the
+    // size fields of `default_netclass` (negative = leave unchanged); preset lists
+    // and the other netclass entries are read-only snapshots.
     py::class_<RLDesignRules>( m, "DesignRules" )
         .def( py::init<>() )
         // Global minima (writable via set_design_rules)
@@ -496,7 +497,7 @@ PYBIND11_MODULE( kicad_rl_router, m )
               "file is missing a blank in-memory PROJECT is attached so design "
               "rules are always consistent. engine_seed >= 0 seeds the (global) KIID "
               "generator at construction for reproducible routing / UUID-keyed DRC "
-              "(decided once at init; -1 = default entropy seeding). "
+              "(decided once at init; < 0 = default entropy seeding). "
               "shove_iter_limit (250) / followbranch_iter_limit (1,000,000) bound the "
               "shove loop and TOPOLOGY::followBranch DFS. They are iteration counts, "
               "not wallclock timeouts, so a given board truncates at the same point "
@@ -520,7 +521,12 @@ PYBIND11_MODULE( kicad_rl_router, m )
               "Corner mode: 0=MITERED_45 (default), 1=ROUNDED_45, "
               "2=MITERED_90 (no diagonals), 3=ROUNDED_90." )
         .def( "set_track_width", &PNS_RL_ROUTER::setTrackWidth, py::arg( "width_mm" ),
-              "Track width in millimetres (0 = use design rules)." )
+              "Override the track width (mm, > 0) for the CURRENT routing session; "
+              "start_route re-imports the net class sizes. Raises on <= 0 and "
+              "outside a routing session." )
+        .def( "get_route_sizes", &PNS_RL_ROUTER::getRouteSizes,
+              "[track_width, via_diameter, via_drill, clearance] in mm the router "
+              "currently holds (set by start_route from the start item's net class)." )
 
         // -- Board manipulation --
         .def( "delete_track_near", &PNS_RL_ROUTER::deleteTrackNear,
@@ -597,6 +603,7 @@ PYBIND11_MODULE( kicad_rl_router, m )
               py::arg( "expected_layer" ) = -1,
               py::arg( "arrive_tol_mm" ) = 0.0,
               py::arg( "require_via" ) = false,
+              py::arg( "trim_at_contact" ) = false,
               "Fix the route at (x,y). force_finish=True commits to board; "
               "False fixes a waypoint and continues routing. "
               "reject_if_stuck=True aborts without committing (returns False) when "
@@ -606,22 +613,38 @@ PYBIND11_MODULE( kicad_rl_router, m )
               "via-placement state. "
               "arrive_tol_mm (0 = exact): accept a head that stopped within this "
               "distance of (x,y) — PNS itself treats a point within head width/2 "
-              "as reached, since the item's copper covers it." )
+              "as reached, since the item's copper covers it. "
+              "trim_at_contact: just before the commit, on every net it touches (the "
+              "route and whatever shove moved), drop committed stretches lying on "
+              "same-net copper and split segments at committed ends, vias and "
+              "same-net crossings so each junction is a joint (route not recomputed; "
+              "vias never removed)." )
+        .def( "optimize_all_lines", &PNS_RL_ROUTER::optimizeAllLines,
+              py::arg( "net_codes" ) = std::vector<int>(), py::arg( "passes" ) = 2,
+              "Final whole-board line optimization (quiescent only; -1 during a "
+              "session): PNS OPTIMIZER over every committed line of the given nets "
+              "(empty = all), topology kept. Not committed: a result touching new "
+              "same-net copper, and one of unchanged shape (a collinear-only merge "
+              "included — the track cleaner's job). Returns lines replaced." )
         .def( "cancel_route", &PNS_RL_ROUTER::cancelRoute,
               "Abort the current route without modifying the board." )
 
         // -- Routing control (Step 4) --
         .def( "finish", &PNS_RL_ROUTER::finish, py::arg( "max_attempts" ) = 5,
-              "Auto-complete route to target pad, retrying ROUTER::Finish up to "
-              "max_attempts times. Returns True on success." )
+              py::arg( "trim_at_contact" ) = false,
+              "Auto-complete route to the nearest unconnected anchor. max_attempts "
+              "bounds ROUTER::Finish's internal move-to-convergence loop (no outer "
+              "retry). Returns True on success. "
+              "trim_at_contact: the same pre-commit cleanup as fix_route's." )
         .def( "undo_last_segment", &PNS_RL_ROUTER::undoLastSegment,
               "Undo the last fixed segment. Returns True if successful." )
         .def( "flip_posture", &PNS_RL_ROUTER::flipPosture,
               "Flip posture (horizontal-first vs vertical-first)." )
 
         // -- Via & Layer (Step 2.5) --
-        .def( "toggle_via", &PNS_RL_ROUTER::toggleVia,
-              "Toggle via placement mode. Next fix will insert a via." )
+        .def( "set_via_placement", &PNS_RL_ROUTER::setViaPlacement, py::arg( "on" ),
+              "Turn via placement on/off (on: the next fix ends with a via). Only "
+              "changeable while a route is in progress; raises otherwise." )
         .def( "switch_layer", &PNS_RL_ROUTER::switchLayer, py::arg( "layer" ),
               "Switch routing layer (inserts via automatically). Returns True on success." )
         .def( "is_placing_via", &PNS_RL_ROUTER::isPlacingVia,
@@ -629,11 +652,11 @@ PYBIND11_MODULE( kicad_rl_router, m )
         .def( "get_current_layer", &PNS_RL_ROUTER::getCurrentLayer,
               "Current routing layer ID (F.Cu=0, B.Cu=2)." )
         .def( "set_via_diameter", &PNS_RL_ROUTER::setViaDiameter, py::arg( "diameter_mm" ),
-              "Set via outer diameter in millimetres." )
+              "Override the via diameter (mm, > 0) for the CURRENT routing session; "
+              "raises on <= 0 and outside a routing session." )
         .def( "set_via_drill", &PNS_RL_ROUTER::setViaDrill, py::arg( "drill_mm" ),
-              "Set via drill diameter in millimetres." )
-        .def( "reset_via_mode", &PNS_RL_ROUTER::resetViaMode,
-              "Reset via placement mode to OFF." )
+              "Override the via drill (mm, > 0) for the CURRENT routing session; "
+              "raises on <= 0 and outside a routing session." )
 
         // -- Dragging --
         .def( "start_drag", &PNS_RL_ROUTER::startDrag,
@@ -671,8 +694,9 @@ PYBIND11_MODULE( kicad_rl_router, m )
         .def( "get_design_rules", &PNS_RL_ROUTER::getDesignRules,
               "Snapshot the board's design rules (BDS + NetSettings) as a DesignRules object." )
         .def( "set_design_rules", &PNS_RL_ROUTER::setDesignRules, py::arg( "rules" ),
-              "Apply the global minima fields of DesignRules (negative values = leave unchanged). "
-              "Preset lists and netclass entries are ignored." )
+              "Apply the global minima and the default_netclass size fields of DesignRules "
+              "(negative values = leave unchanged; a Default class size of 0 raises). Preset "
+              "lists and the other netclass entries are ignored." )
         .def( "get_netclass_for_net",
               &PNS_RL_ROUTER::getNetClassForNet, py::arg( "net_code" ),
               "Return the NetClassInfo KiCad assigns to the given net code "
@@ -816,6 +840,10 @@ PYBIND11_MODULE( kicad_rl_router, m )
               "fix_route call) without re-creating the engine." )
         .def( "get_shove_iter_limit", &PNS_RL_ROUTER::getShoveIterationLimit,
               "Current shove iteration bound (see set_shove_iter_limit)." )
+        .def( "get_followbranch_iter_limit", &PNS_RL_ROUTER::getFollowBranchIterLimit,
+              "Current TOPOLOGY::followBranch DFS pop bound (set at construction)." )
+        .def( "get_engine_seed", &PNS_RL_ROUTER::getEngineSeed,
+              "engine_seed passed at construction (< 0 = entropy seeding)." )
 
         // -- I/O --
         .def( "save", &PNS_RL_ROUTER::save,

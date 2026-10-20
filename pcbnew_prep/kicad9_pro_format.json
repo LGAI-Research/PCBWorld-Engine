@@ -1,0 +1,5 @@
+{
+  "_source": "The .kicad_pro format KiCad 9.0.8 writes: meta.version = projectFileSchemaVersion (common/project/project_file.cpp), net_settings.meta.version = netSettingsSchemaVersion (common/project/net_settings.cpp). Read by engine/pcbnew_prep/dsn_classes.py and the rule-based runner; nothing else is accepted.",
+  "project_meta_version": 3,
+  "net_settings_meta_version": 4
+}

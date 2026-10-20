@@ -197,6 +197,11 @@ void PNS_RL_IFACE::AddItem( PNS::ITEM* aItem )
 
     if( boardItem )
     {
+        // As the stock PNS_KICAD_IFACE::createBoardItem does: a locked item the router
+        // re-creates (one half of a split locked track) stays locked on the board.
+        if( aItem->IsLocked() )
+            boardItem->SetLocked( true );
+
         aItem->SetParent( boardItem );
         m_pendingAdd.push_back( boardItem );
     }

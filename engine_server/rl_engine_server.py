@@ -176,13 +176,15 @@ class _EngineHost:
         # no upgrade/normalize cache. The post-load contract checks
         # (was_legacy_design_settings_loaded / was_project_loaded_from_file /
         # allow_default_rules) run ENV-SIDE through ordinary proxy calls.
+        # The client sends every construction value: a missing one is a KeyError
+        # here, never a default of the server's own.
         board_path = kwargs["board_path"]
         self.router = self.krl.RLRouter(
             str(board_path),
-            kwargs.get("project_path") or "",
-            int(kwargs.get("seed", -1)),
-            int(kwargs.get("shove_iter_limit", 250)),
-            int(kwargs.get("followbranch_iter_limit", 1_000_000)),
+            kwargs["project_path"],
+            int(kwargs["seed"]),
+            int(kwargs["shove_iter_limit"]),
+            int(kwargs["followbranch_iter_limit"]),
         )
         return {"board_path": str(board_path)}
 

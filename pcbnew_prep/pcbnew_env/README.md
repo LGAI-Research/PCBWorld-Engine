@@ -8,14 +8,13 @@
 > mirrors were originally produced, and to reconstruct the historic apt build's
 > `host_version` string by hand if anyone ever needs to.
 >
-> The source-built module's output is verified against those mirrors (2026-09-01, see
-> `../README.md`): `.orp` byte-identical (timestamp aside); `.dsn` byte-identical
-> (path + `host_version` aside) up to the script's own later `SetCopperLayerCount(1)`
-> change, which no build reproduces the mirror through.
+> The source-built module's output is checked against those mirrors in `../README.md`;
+> the `.dsn` differs from them by the script's one-copper-layer export, which no build
+> reproduces the mirror through.
 
 The synthetic-board Freerouting input (`*_unrouted.dsn`) and OrthoRoute
 (`*.orp`) files are produced by **KiCad's `pcbnew` Python module** through
-`pcbnew_prep/make_dsn_orp_synth_1l_g10.py`. This documents the exact
+`pcbnew_prep/make_dsn_orp_synth_1l.py`. This documents the exact
 generator build, how to stand up a fresh environment, and the byte-level
 reproduction results.
 
@@ -76,12 +75,13 @@ content is identical either way (below).
 
 Reads `SYNTH1L_PCB_ROOT/<split>/board_*.kicad_pcb` (+`.kicad_pro`), strips
 routing, exports DSN, then patches netclass rules from the `.kicad_pro`. It
-imports `remove_routing` from `setup_drvzero.py`, which sits **next to the
-converter** in `pcbnew_prep/` (a self-contained copy; the converter
+imports `remove_routing` from `setup_drvzero.py` and the net-class rewrite from
+`dsn_classes.py` / `dsn_units.py`, which sit **next to the converter** in `pcbnew_prep/`
+(self-contained copies; the converter
 auto-adds its own directory to `sys.path`), so **no `PYTHONPATH` is needed**
 and nothing outside this repo is required.
 
-The converter and `setup_drvzero.py` are both in this repo, so the only
+The converter, `setup_drvzero.py`, `dsn_classes.py` and `dsn_units.py` are all in this repo, so the only
 machine-specific inputs are (a) where you checked out the repo and (b) where your
 `board_*.kicad_pcb` dataset lives. Parameterize both and mount them read-only:
 
@@ -96,14 +96,13 @@ docker run --rm \
   -e SYNTH1L_PCB_ROOT=/data \
   -e SYNTH1L_DSN_ROOT=/out \
   pcbnew-repro:9.0 \
-  python3 /repo/pcbnew_prep/make_dsn_orp_synth_1l_g10.py \
+  python3 /repo/pcbnew_prep/make_dsn_orp_synth_1l.py \
   --splits test --limit 5
 ```
 
 > Self-containment verified 2026-05-29: mounting only the repo (read-only),
 > **without** `PYTHONPATH` and **without** the original prep tree, converts
-> cleanly and reproduces the reference DSN body byte-for-byte (3/3 boards). The
-> copied `setup_drvzero.py` is md5-identical to the original.
+> cleanly and reproduces the reference DSN body byte-for-byte (3/3 boards).
 
 Files written by the container are owned by `root` (it runs as root); `chown`
 them back, or clean up with

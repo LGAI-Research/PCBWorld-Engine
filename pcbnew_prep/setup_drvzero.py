@@ -16,14 +16,6 @@ import math
 import shutil
 from pathlib import Path
 
-_data_dir = os.environ.get("DRVZERO_DATA_DIR")
-if not _data_dir:
-    raise SystemExit("DRVZERO_DATA_DIR is not set — see this script's docstring.")
-DATA_DIR = Path(_data_dir)
-DRVZERO_SRC = DATA_DIR / "pcbbench_drvzero_filtered"
-PCBS_DIR = DATA_DIR / "PCBench" / "PCBs"
-DEST_DIR = DATA_DIR / "drvzero_filtered"
-
 # DSN unit: KiCad mm * 10000 -> um/10 (Specctra resolution um 10)
 MM2DSN = 10000.0
 
@@ -596,6 +588,13 @@ def export_dsn(pcb_sexp, out_path, pcb_name):
 # ─────────────────────────────────────────────
 
 def main():
+    # Read here, not at import: the make_dsn_orp_* converters import remove_routing only.
+    data_dir = os.environ.get("DRVZERO_DATA_DIR")
+    if not data_dir:
+        raise SystemExit("DRVZERO_DATA_DIR is not set — see this script's docstring.")
+    DRVZERO_SRC = Path(data_dir) / "pcbbench_drvzero_filtered"
+    PCBS_DIR = Path(data_dir) / "PCBench" / "PCBs"
+    DEST_DIR = Path(data_dir) / "drvzero_filtered"
     DEST_DIR.mkdir(parents=True, exist_ok=True)
 
     entries = sorted(os.listdir(DRVZERO_SRC))

@@ -3,6 +3,13 @@
 Release notes for the PCBWorld Engine, newest first. This is a separate program from the
 PCBWorld environment, which pins one engine commit per environment release.
 
+## v1.2.1 — 2026-11-11
+
+Contact change only. Router sources, build script and wire protocol are as in v1.2.0 — no rebuild needed.
+
+### Changed
+- `README.md` — contact address yj.park@lgresearch.ai
+
 ## v1.2.0 — 2026-11-11
 
 Determinism and build release. Wire protocol still 2, routing calls unchanged. The ratsnest behind

@@ -121,5 +121,5 @@ single shove can legitimately take minutes.
 ## Contact
 
 Questions and bug reports about the engine: open an issue here, or write to
-hyungseok.song@lgresearch.ai. Issues about the environment, training or
+yj.park@lgresearch.ai. Issues about the environment, training or
 evaluation belong in the environment repository.

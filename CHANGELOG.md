@@ -3,6 +3,27 @@
 Release notes for the PCBWorld Engine, newest first. This is a separate program from the
 PCBWorld environment, which pins one engine commit per environment release.
 
+## v1.2.0 — 2026-11-11
+
+Determinism and build release. Wire protocol still 2, routing calls unchanged. The ratsnest behind
+`get_ratsnest` and `get_routing_target` is now ordered by board content: where one net has several
+clusters at one position (a front and a back pad at the same spot) it no longer varies run to run
+and differs from v1.1.0; on any board, which of several equal-length edges is reported can differ,
+while the number of edges per net is the same.
+
+### Added
+- macOS (Apple Silicon) build — `build_rl_router.sh` builds inside a conda env that has clang, from
+  the env alone; package list in `README.md`, optional `BUILD_PCBNEW` / `BUILD_CLI` targets not yet verified there
+
+### Changed
+- `build_rl_router.sh` — refuses a `BUILD_DIR` that is a symlink and names its target
+- `kicad-patches/ENGINE_VERSION` 1.7 → 1.9 — the router source hash changed, rebuild before use
+
+### Fixed
+- Ratsnest order — MST anchors sort by content (position, layer range, parent type and UUID, zone
+  sub-polygon, anchor index) instead of heap address and edges sort stably, so coincident anchors no longer follow allocation order
+- `PCBWorld-mod` markers — the single-position anchor branch of `ratsnest_data.cpp`, modified before this release, now carries one (comments only)
+
 ## v1.1.0 — 2026-10-20
 
 Routing release. Wire protocol still 2. Each route now takes its sizes from the start net's class,

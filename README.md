@@ -40,7 +40,25 @@ Output: `build_rl/pcbnew/python/rl/kicad_rl_router.so`, stamped with a copy of
 `kicad-patches/ENGINE_VERSION` for build provenance.
 
 `BUILD_DIR` overrides where the build lands; the environment sets it to its own tree so
-the module is built once, next to the code that spawns this server.
+the module is built once, next to the code that spawns this server. A `BUILD_DIR` that is a
+symlink is refused (it usually leads into another checkout, whose router may be in use); pass
+its target to build there on purpose.
+
+### macOS
+
+On macOS (Apple Silicon) the script builds only inside a conda env that has the compiler, and from
+the env alone — the env's clang, `<cstdlib>` pre-included for KiCad's bundled fmt, Homebrew
+prefixes ignored, the env's OCC — and fetches the one ngspice header KiCad includes (pinned by
+sha256) into `$BUILD_DIR/macos_deps/`. Without such an env (none active, or one without `clang++`)
+it stops; a Homebrew-based build is not supported. The environment repository's
+`environment.macos.yml` is that env; standalone, create it from conda-forge:
+
+```bash
+conda create -n engine -c conda-forge python=3.12 cxx-compiler cmake ninja pkg-config boost \
+  "wxwidgets<3.3" zlib expat occt=7.9 protobuf libprotobuf glew glfw glm libgit2 swig=4.4 "nng<2" \
+  unixodbc libsecret cairo pixman harfbuzz pybind11
+conda run -n engine bash build_rl_router.sh
+```
 
 ### Optional targets: `kicad-cli` and the `pcbnew` Python module
 
@@ -64,9 +82,9 @@ PYTHONPATH=build_rl/pcbnew python -c 'import pcbnew; print(pcbnew.GetBuildVersio
   in `pcbnew/`) only with `KICAD_RUN_FROM_BUILD_DIR=1` in its environment; without it every
   `pcb` command fails with "Failed to load kiface library".
 - `BUILD_PCBNEW=1` needs SWIG (`swig` on `PATH`) and OpenCASCADE: the kiface carries the
-  STEP exporter. The script hands the Homebrew or the active conda env's OCC to CMake
-  whenever one is present — for engine-only builds too, so the configuration does not flip
-  between the two invocations of one build tree. The RL module itself never touches OCC.
+  STEP exporter. The script hands the active conda env's OCC (and abseil, protobuf, utf8_range)
+  to CMake whenever the env has them — for engine-only builds too, so the configuration does not
+  flip between the two invocations of one build tree. The RL module itself never touches OCC.
 - Cost (64-core host): the three targets together are 1 352 ninja steps from scratch, about
   4.5 minutes. A tree configured before OCC was available recompiles everything once when
   OCC first lands (the compile flags change). Re-running the script with unchanged sources

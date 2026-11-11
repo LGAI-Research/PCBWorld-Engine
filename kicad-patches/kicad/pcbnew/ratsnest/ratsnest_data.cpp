@@ -44,6 +44,70 @@ using namespace std::placeholders;
 
 #include <delaunator.hpp>
 
+// PCBWorld-mod begin 2026-10-31
+#include <board_connected_item.h>
+
+
+// Content-derived strict order of ratsnest anchors: position, then the owning
+// item's copper layer range, parent type and parent UUID, zone sub-polygon, and
+// the anchor's index within its item. Distinct anchors never compare equal.
+//
+// Upstream orders coincident anchors by insertion order (CN_PTR_CMP compares
+// position only) and clusters by CN_CLUSTER* address. Insertion order follows
+// SearchClusters' std::set<CN_ITEM*>, i.e. heap-address order, so at a position
+// shared by several clusters (a front and a back pad at one spot) WHICH anchor
+// represents the position in the triangulation varied run to run — and with it
+// which cluster the MST connected to. Same board, different ratsnest edges.
+static size_t anchorIndex( const std::shared_ptr<CN_ANCHOR>& aAnchor )
+{
+    const std::vector<std::shared_ptr<CN_ANCHOR>>& anchors = aAnchor->Item()->Anchors();
+    return std::find( anchors.begin(), anchors.end(), aAnchor ) - anchors.begin();
+}
+
+
+struct CN_ANCHOR_CONTENT_CMP
+{
+    bool operator()( const std::shared_ptr<CN_ANCHOR>& aA,
+                     const std::shared_ptr<CN_ANCHOR>& aB ) const
+    {
+        if( aA->Pos().x != aB->Pos().x )
+            return aA->Pos().x < aB->Pos().x;
+
+        if( aA->Pos().y != aB->Pos().y )
+            return aA->Pos().y < aB->Pos().y;
+
+        CN_ITEM* ia = aA->Item();
+        CN_ITEM* ib = aB->Item();
+
+        if( ia != ib )
+        {
+            if( ia->StartLayer() != ib->StartLayer() )
+                return ia->StartLayer() < ib->StartLayer();
+
+            if( ia->EndLayer() != ib->EndLayer() )
+                return ia->EndLayer() < ib->EndLayer();
+
+            const BOARD_CONNECTED_ITEM* pa = ia->Parent();
+            const BOARD_CONNECTED_ITEM* pb = ib->Parent();
+
+            if( pa->Type() != pb->Type() )
+                return pa->Type() < pb->Type();
+
+            if( pa->m_Uuid != pb->m_Uuid )
+                return pa->m_Uuid < pb->m_Uuid;
+
+            // One zone yields one CN_ZONE_LAYER per (layer, filled sub-polygon).
+            const CN_ZONE_LAYER* za = dynamic_cast<const CN_ZONE_LAYER*>( ia );
+            const CN_ZONE_LAYER* zb = dynamic_cast<const CN_ZONE_LAYER*>( ib );
+
+            if( za && zb && za->SubpolyIndex() != zb->SubpolyIndex() )
+                return za->SubpolyIndex() < zb->SubpolyIndex();
+        }
+
+        return anchorIndex( aA ) < anchorIndex( aB );
+    }
+};
+// PCBWorld-mod end
 class disjoint_set
 {
 
@@ -137,7 +201,9 @@ void RN_NET::kruskalMST( const std::vector<CN_EDGE> &aEdges )
 class RN_NET::TRIANGULATOR_STATE
 {
 private:
-    std::multiset<std::shared_ptr<CN_ANCHOR>, CN_PTR_CMP> m_allNodes;
+    // PCBWorld-mod begin 2026-10-31
+    std::multiset<std::shared_ptr<CN_ANCHOR>, CN_ANCHOR_CONTENT_CMP> m_allNodes;
+    // PCBWorld-mod end
 
 
     // Checks if all nodes in aNodes lie on a single line. Requires the nodes to
@@ -209,6 +275,7 @@ public:
         }
         else if( anchors.size() == 1 )
         {
+            // PCBWorld-mod begin 2026-11-11
             // All anchors share one position — nothing to triangulate. Fall
             // through to the per-position anchor-chain pass below, which emits
             // one weight-1 edge per pair of DISTINCT clusters (cluster
@@ -217,6 +284,7 @@ public:
             // than their actual copper (through vias/pads, multi-layer zones),
             // so a cross-cluster pair could be silently treated as connected
             // and the required edge dropped (undercount).
+            // PCBWorld-mod end
         }
         else if( areNodesColinear( anchors ) )
         {
@@ -254,11 +322,13 @@ public:
             if( chain.size() < 2 )
                 continue;
 
-            std::sort( chain.begin(), chain.end(),
-                    [] ( const std::shared_ptr<CN_ANCHOR>& a, const std::shared_ptr<CN_ANCHOR>& b )
-                    {
-                        return a->GetCluster().get() < b->GetCluster().get();
-                    } );
+            // PCBWorld-mod begin 2026-10-31
+            // No re-sort by CN_CLUSTER* address: the chain is already in
+            // CN_ANCHOR_CONTENT_CMP order. Same-cluster anchors need not be
+            // adjacent — AddCluster's weight-0 board edges join them before any
+            // weight-1 chain edge is considered, so the MST still spends exactly
+            // one weight-1 edge per extra cluster at this position.
+            // PCBWorld-mod end
 
             for( unsigned int j = 1; j < chain.size(); j++ )
             {
@@ -328,7 +398,13 @@ void RN_NET::compute()
     for( const CN_EDGE& e : m_boardEdges )
         triangEdges.emplace_back( e );
 
-    std::sort( triangEdges.begin(), triangEdges.end() );
+    // PCBWorld-mod begin 2026-10-31
+    // Stable: CN_EDGE::operator< compares weight only, so equal-weight edges keep
+    // the (now content-ordered) triangulation order instead of whatever
+    // permutation std::sort leaves; m_boardEdges, appended last in cluster
+    // (heap-address) order, are all weight 0 and only merge within a cluster.
+    std::stable_sort( triangEdges.begin(), triangEdges.end() );
+    // PCBWorld-mod end
 
 // Get the minimal spanning tree
 #ifdef PROFILE

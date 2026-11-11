@@ -12,10 +12,41 @@ else
     HOST_ROOT="$BUNDLE_DIR"
 fi
 BUILD_DIR="${BUILD_DIR:-${HOST_ROOT}/build_rl}"
+# Absolute and without a trailing slash: the script cds into it before CMake reads the paths
+# below, and `[ -L dir/ ]` would follow the link.
+case "$BUILD_DIR" in /*) ;; *) BUILD_DIR="$PWD/$BUILD_DIR" ;; esac
+BUILD_DIR="${BUILD_DIR%/}"
 KICAD_SRC_ORIG="${BUNDLE_DIR}/kicad-python/kicad"
 KICAD_SRC="${BUILD_DIR}/kicad_src"
 PATCHES_DIR="${BUNDLE_DIR}/kicad-patches"
 VENV_DIR="${VENV_DIR:-${HOST_ROOT}/.venv}"
+
+# A symlinked build dir usually points into another checkout, whose router a running job may
+# be using: building through it would replace that .so. Name the target to build there.
+if [ -L "$BUILD_DIR" ]; then
+    echo "ERROR: $BUILD_DIR is a symlink (-> $(readlink "$BUILD_DIR")); refusing to build through it."
+    echo "  To build there on purpose: BUILD_DIR=\"$(readlink -f "$BUILD_DIR")\" bash $0"
+    exit 1
+fi
+
+# macOS builds only inside a conda env that carries the toolchain (the PCBWorld
+# environment.macos.yml), from the env alone: CMake's macOS search path lists /opt/homebrew
+# ahead of the env, so a Homebrew fmt, protobuf, wxWidgets 3.3 or OCC would shadow the env's,
+# and a Homebrew-based build has never been verified. The env's bin/ goes first on PATH for
+# cmake and wx-config; the compiler and Homebrew exclusion are passed in Step 3.
+MACOS_CONDA=0
+if [ "$(uname -s)" = Darwin ]; then
+    if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "$CONDA_PREFIX/bin/clang++" ]; then
+        echo "ERROR: on macOS the engine builds inside a conda env with the compiler (cxx-compiler);"
+        echo "  ${CONDA_PREFIX:-no conda env is active}${CONDA_PREFIX:+ has no bin/clang++}."
+        echo "  Create one with the packages in this engine's README (section macOS) — in PCBWorld,"
+        echo "  environment.macos.yml — and run the script inside it (conda run -n <env> bash $0);"
+        echo "  a Homebrew-based build is not supported."
+        exit 1
+    fi
+    MACOS_CONDA=1
+    export PATH="$CONDA_PREFIX/bin:$PATH"
+fi
 
 # ──────────────────────────────────────────────
 # Build options (overridable via environment variables)
@@ -23,7 +54,7 @@ VENV_DIR="${VENV_DIR:-${HOST_ROOT}/.venv}"
 # ──────────────────────────────────────────────
 BUILD_PCBNEW="${BUILD_PCBNEW:-0}"         # 1=include (kiface + python module), 0=exclude (default: exclude)
 BUILD_CLI="${BUILD_CLI:-0}"               # 1=include kicad-cli (headless DRC for the data-prep chain, SVG/PDF rendering), 0=exclude (default: exclude)
-USE_CONDA=0
+USE_CONDA=$MACOS_CONDA                    # macOS (always the conda build) implies --conda
 
 # Parse arguments
 for arg in "$@"; do
@@ -36,19 +67,18 @@ echo "=== Build Options ==="
 echo "  BUILD_PCBNEW:    $BUILD_PCBNEW"
 echo "  BUILD_CLI:       $BUILD_CLI"
 echo "  USE_CONDA:       $USE_CONDA"
+echo "  MACOS_CONDA:     $MACOS_CONDA"
 
 # ──────────────────────────────────────────────
 # Dependency check
 # ──────────────────────────────────────────────
 echo "=== Dependency Check ==="
 
-# cmake (prefer Homebrew path)
+# cmake
 CMAKE="${CMAKE:-}"
 if [ -z "$CMAKE" ]; then
     if command -v cmake &>/dev/null; then
         CMAKE="cmake"
-    elif [ -x /opt/homebrew/opt/cmake/bin/cmake ]; then
-        CMAKE="/opt/homebrew/opt/cmake/bin/cmake"
     else
         echo "ERROR: cmake not found"; exit 1
     fi
@@ -105,7 +135,7 @@ echo "  wxWidgets: $(wx-config --version)"
 if [ "$BUILD_PCBNEW" = "1" ]; then
     if ! command -v swig &>/dev/null; then
         echo "ERROR: swig not found (required for pcbnew Python bindings)"
-        echo "  Install: brew install swig"
+        echo "  Install SWIG 4.4 (conda: conda install -c conda-forge swig=4.4)"
         exit 1
     fi
     SWIG_VER=$(swig -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -299,36 +329,60 @@ if [ "$USE_CONDA" = "1" ]; then
     echo "  conda prefix: $CONDA_PREFIX"
 fi
 
-# protobuf/abseil/utf8_range: since the conda env's headers are included
-# first, using conda's cmake config keeps protoc/headers/lib consistent.
-# If a conda env is active and has a cmake config, try conda first;
-# otherwise fall back to brew.
-if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib/cmake/absl" ]; then
-    CMAKE_ARGS+=("-Dabsl_DIR=$CONDA_PREFIX/lib/cmake/absl")
-elif [ -d /opt/homebrew/lib/cmake/absl ]; then
-    CMAKE_ARGS+=("-Dabsl_DIR=/opt/homebrew/lib/cmake/absl")
-fi
-if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib/cmake/protobuf" ]; then
-    CMAKE_ARGS+=("-DProtobuf_DIR=$CONDA_PREFIX/lib/cmake/protobuf")
-elif [ -d /opt/homebrew/lib/cmake/protobuf ]; then
-    CMAKE_ARGS+=("-DProtobuf_DIR=/opt/homebrew/lib/cmake/protobuf")
-fi
-if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib/cmake/utf8_range" ]; then
-    CMAKE_ARGS+=("-Dutf8_range_DIR=$CONDA_PREFIX/lib/cmake/utf8_range")
-elif [ -d /opt/homebrew/lib/cmake/utf8_range ]; then
-    CMAKE_ARGS+=("-Dutf8_range_DIR=/opt/homebrew/lib/cmake/utf8_range")
-fi
+# protobuf/abseil/utf8_range: since the conda env's headers are included first, using
+# conda's cmake config keeps protoc/headers/lib consistent.
+for dep in absl:absl Protobuf:protobuf utf8_range:utf8_range; do
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib/cmake/${dep#*:}" ]; then
+        CMAKE_ARGS+=("-D${dep%%:*}_DIR=$CONDA_PREFIX/lib/cmake/${dep#*:}")
+    fi
+done
 # OpenCASCADE: optional for the engine (the RL router never touches it) but required by
 # pcbnew_kiface (STEP exporter), i.e. by BUILD_PCBNEW=1. FindOCC.cmake searches fixed
-# system prefixes only, so a Homebrew or conda OCC (environment.yml ships `occt`) has to
-# be pointed at explicitly. Passed whenever present so the configuration does not flip
+# system prefixes only, so the conda env's OCC (environment.yml ships `occt`) has to be
+# pointed at explicitly. Passed whenever present so the configuration does not flip
 # between engine-only and BUILD_PCBNEW=1 runs of the same build tree.
-if [ -f /opt/homebrew/include/opencascade/Standard_Handle.hxx ]; then
-    CMAKE_ARGS+=("-DOCC_INCLUDE_DIR=/opt/homebrew/include/opencascade")
-    CMAKE_ARGS+=("-DOCC_LIBRARY_DIR=/opt/homebrew/lib")
-elif [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/include/opencascade/Standard_Handle.hxx" ]; then
-    CMAKE_ARGS+=("-DOCC_INCLUDE_DIR=$CONDA_PREFIX/include/opencascade")
-    CMAKE_ARGS+=("-DOCC_LIBRARY_DIR=$CONDA_PREFIX/lib")
+if [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/include/opencascade/Standard_Handle.hxx" ]; then
+    CMAKE_ARGS+=("-DOCC_INCLUDE_DIR=$CONDA_PREFIX/include/opencascade" "-DOCC_LIBRARY_DIR=$CONDA_PREFIX/lib")
+fi
+
+# macOS conda build (see MACOS_CONDA above). The compilers are passed on every configure, so
+# a build tree first configured with Apple clang is switched over (CMake re-runs from scratch).
+#   - cxx-compiler 2.x exports no CC/CXX; without them CMake picks Apple's /usr/bin/c++.
+#   - KiCad 9.0.8 bundles fmt 11.1.1, whose format.h calls malloc/free without <cstdlib>;
+#     conda-forge's libc++ 21 no longer includes it transitively, so it is pre-included
+#     (appended to the env's CXXFLAGS and passed on every configure).
+#   - common/build_version.cpp includes <ngspice/sharedspice.h> unconditionally and
+#     conda-forge has no osx-arm64 ngspice: that one header is fetched, pinned to
+#     ngspice 41 (what the Linux env resolves); the library itself stays unused.
+if [ "$MACOS_CONDA" = "1" ]; then
+    NGSPICE_ROOT="$BUILD_DIR/macos_deps"
+    NGSPICE_HDR="$NGSPICE_ROOT/include/ngspice/sharedspice.h"
+    NGSPICE_HDR_URL="https://sourceforge.net/p/ngspice/ngspice/ci/ngspice-41/tree/src/include/ngspice/sharedspice.h?format=raw"
+    NGSPICE_HDR_SHA256="6c34c8c21a2baf9a88051c0aa2805751ba1b29a7e4841ede4f0879bbad23ee26"
+    if [ -f "$NGSPICE_HDR" ]; then
+        echo "$NGSPICE_HDR_SHA256  $NGSPICE_HDR" | shasum -a 256 -c - ||
+            { echo "ERROR: remove $NGSPICE_HDR and rerun (it is fetched again)"; exit 1; }
+    else
+        # fetched to .part and moved only once verified, so a cut-off or HTML download never sticks
+        mkdir -p "$(dirname "$NGSPICE_HDR")"
+        curl -fsSL -o "$NGSPICE_HDR.part" "$NGSPICE_HDR_URL"
+        echo "$NGSPICE_HDR_SHA256  $NGSPICE_HDR.part" | shasum -a 256 -c -
+        mv "$NGSPICE_HDR.part" "$NGSPICE_HDR"
+    fi
+    # A tree configured by the earlier tools/setup/macos_conda_toolchain.cmake (now deleted)
+    # re-includes that file on every configure; CMake would fail with a bare include error.
+    if [ -f "$BUILD_DIR/CMakeCache.txt" ] && grep -q '^CMAKE_TOOLCHAIN_FILE:.*macos_conda_toolchain\.cmake$' "$BUILD_DIR/CMakeCache.txt"; then
+        echo "ERROR: $BUILD_DIR was configured with the removed macos_conda_toolchain.cmake;"
+        echo "  remove it (rm -rf $BUILD_DIR) and rerun"
+        exit 1
+    fi
+    CMAKE_ARGS+=(
+        "-DCMAKE_CXX_FLAGS=${CXXFLAGS:-} -include cstdlib"
+        "-DCMAKE_C_COMPILER=$CONDA_PREFIX/bin/clang"
+        "-DCMAKE_CXX_COMPILER=$CONDA_PREFIX/bin/clang++"
+        "-DCMAKE_SYSTEM_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local"
+        "-DNGSPICE_ROOT_DIR=$NGSPICE_ROOT"
+    )
 fi
 
 $CMAKE "${CMAKE_ARGS[@]}"
